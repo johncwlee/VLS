@@ -223,16 +223,28 @@ class GeminiStageRecognizer:
         
         Args:
             config: Configuration dict with:
-                - api_key: Google API key
+                - provider: 'gemini' (default) or 'openai' (any OpenAI-compatible server, e.g. vLLM)
+                - api_key: API key (default: GOOGLE_API_KEY or OPENAI_API_KEY env var, by provider)
+                - base_url: OpenAI-compatible endpoint (openai provider only)
                 - model: Model name (default: gemini-2.5-flash)
+                - max_completion_tokens: Response token cap (openai provider only)
                 - stage_template_path: Path to prompt template (optional)
         """
         self.config = config
-        self.api_key = config.get('api_key') or os.environ.get('GOOGLE_API_KEY')
+        self.provider = config.get('provider', 'gemini')
         self.model = config.get('model', 'gemini-2.5-flash')
-        
-        if not self.api_key:
-            raise ValueError("Gemini API key required. Set 'api_key' in config or GOOGLE_API_KEY env var.")
+        if self.provider == 'gemini':
+            self.api_key = config.get('api_key') or os.environ.get('GOOGLE_API_KEY')
+            if not self.api_key:
+                raise ValueError("Gemini API key required. Set 'api_key' in config or GOOGLE_API_KEY env var.")
+        elif self.provider == 'openai':
+            # Local servers (vLLM) ignore the key, but the OpenAI client requires one.
+            self.api_key = config.get('api_key') or os.environ.get('OPENAI_API_KEY') or (
+                'EMPTY' if config.get('base_url') else None)
+            if not self.api_key:
+                raise ValueError("OpenAI API key required. Set 'api_key' or 'base_url' in config, or OPENAI_API_KEY env var.")
+        else:
+            raise ValueError(f"Unknown stage recognizer provider: {self.provider!r} (expected 'gemini' or 'openai')")
         
         # Load prompt template
         template_path = config.get('stage_template_path')
@@ -245,10 +257,14 @@ class GeminiStageRecognizer:
             self.prompt_template = f.read()
         
         self._setup_client()
-        logger.info(f"GeminiStageRecognizer initialized with model: {self.model}")
-    
+        logger.info(f"GeminiStageRecognizer initialized with {self.provider} model: {self.model}")
+
     def _setup_client(self):
-        """Setup Google Generative AI client."""
+        """Setup Google Generative AI client, or an OpenAI client for the openai provider."""
+        if self.provider == 'openai':
+            from openai import OpenAI
+            self.client = OpenAI(api_key=self.api_key, base_url=self.config.get('base_url'))
+            return
         try:
             import google.generativeai as genai
             genai.configure(api_key=self.api_key)
@@ -329,8 +345,11 @@ class GeminiStageRecognizer:
             content.append("**Current Image:**")
             content.append(current_img)
             
-            response = self.client.generate_content(content)
-            output = response.text.strip()
+            if self.provider == 'openai':
+                output = self._generate_openai(content)
+            else:
+                response = self.client.generate_content(content)
+                output = response.text.strip()
             
             # Parse stage number
             import re
@@ -350,12 +369,30 @@ class GeminiStageRecognizer:
             if evidence_match:
                 evidence = evidence_match.group(1).strip()
             
-            logger.info(f"[Gemini] Stage:{stage_num} Guide:{'ON' if need_guidance else 'OFF'} | {evidence[:80]}")
+            logger.info(f"[{self.provider}] Stage:{stage_num} Guide:{'ON' if need_guidance else 'OFF'} | {evidence[:80]}")
             return stage_num, need_guidance
-            
+
         except Exception as e:
-            logger.error(f"Gemini stage recognition failed: {e}")
+            logger.error(f"{self.provider} stage recognition failed: {e}")
             return 1, True
+
+    def _generate_openai(self, content: list) -> str:
+        """Send the Gemini-style content list (str / PIL images) as one OpenAI chat message."""
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append({"type": "text", "text": item})
+            else:
+                buffer = io.BytesIO()
+                item.save(buffer, format='PNG')
+                url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode('utf-8')
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": parts}],
+            max_completion_tokens=self.config.get('max_completion_tokens', 4000),
+        )
+        return (response.choices[0].message.content or "").strip()
 
 
 def create_gemini_stage_recognizer(config: dict) -> GeminiStageRecognizer:
