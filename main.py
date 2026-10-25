@@ -19,7 +19,7 @@ from typing import Any, Callable, List, Optional
 import gymnasium as gym
 import numpy as np
 import torch
-from collections import deque
+from collections import Counter, deque
 from PIL import Image
 import cv2
 import imageio
@@ -60,7 +60,7 @@ from core.keypoint_tracker import KeypointTracker
 from core.keypoint_detector import KeypointDetector
 from core.sam3_segmenter import create_segmenter as create_sam3_segmenter
 from core.gemini_grounder import create_gemini_grounder, create_gemini_stage_recognizer
-from vlm_query.vlm_agent import VLMAgent
+from vlm_query.vlm_agent import VLMAgent, VLMCallError
 from utils.vis_utils import TrajectoryVideoRecorder, add_text_to_image
 
 from core.diffusion_policy_steer import DiffusionPolicySteer
@@ -77,6 +77,22 @@ from utils.logging_utils import SteerLogger
 log = SteerLogger("Main")
 
 
+def _require_cuda(cfg: dict):
+    """Fail fast unless CUDA is available and every `device` setting in the resolved config is CUDA."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available; VLS requires a CUDA GPU (check the driver and envs/vls torch build).")
+    bad = []
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == 'device' and not str(value).startswith('cuda'):
+                    bad.append(f"{path}{key}={value}")
+                walk(value, f"{path}{key}.")
+    walk(cfg, "")
+    if bad:
+        raise RuntimeError(f"VLS requires CUDA, but these config settings are not CUDA: {bad}")
+
+
 class Main:
     def __init__(self, cfg: DictConfig):
         """
@@ -87,7 +103,8 @@ class Main:
         """
         self.cfg = cfg
         self.config = cfg.main  # Shortcut to main config section
-        
+        _require_cuda(OmegaConf.to_container(cfg, resolve=True))
+
         # Log the resolved configuration
         log.info(f"Configuration:\n{OmegaConf.to_yaml(cfg, resolve=True)[:500]}...")
 
@@ -205,11 +222,11 @@ class Main:
         gemini_config = perception_cfg.get('gemini_grounding', {})
         self.use_gemini = gemini_config.get('enabled', False) if gemini_config else False
         if self.use_gemini:
-            api_key = gemini_config.get('api_key') or os.environ.get('GOOGLE_API_KEY')
-            if api_key:
+            # Only the gemini provider needs a Google key; the grounder resolves keys itself
+            provider = gemini_config.get('provider', 'gemini')
+            if provider != 'gemini' or gemini_config.get('api_key') or os.environ.get('GOOGLE_API_KEY'):
                 gemini_dict = OmegaConf.to_container(gemini_config, resolve=True)
-                gemini_dict['api_key'] = api_key
-                log.info("Initializing Gemini grounder for visual grounding")
+                log.info(f"Initializing {provider} grounder for visual grounding")
                 self.gemini_grounder = create_gemini_grounder(gemini_dict)
                 self.gemini_default_objects = list(gemini_config.get('default_objects', []))
             else:
@@ -457,8 +474,12 @@ class Main:
         self.success_count = 0
         base_output_dir = self.output_dir
         episode_num = self.config.get('episode_num', 10)
-        
+        trials = []
+        vlm_clients = [c for c in (self.gemini_grounder, self.gemini_stage_recognizer, self.vlm_agent) if c is not None]
+
         for episode in range(episode_num):
+            for client in vlm_clients:
+                client.errors.clear()
             episode_seed = torch.randint(0, 1000, (1,)).item()
             self.policy.reset()
             self.video_recorder.clear()
@@ -477,32 +498,42 @@ class Main:
             
             # Perform task preparation with error handling
             episode_error = False
+            trial = {'episode': episode + 1, 'task_id': task_info.get('task_id'), 'error': None}
             if self.config.get("use_guidance", True):
                 try:
                     self.perform_task_for_episode(episode_dir)
                 except Exception as e:
                     log.error(f"Episode {episode+1} preparation failed: {e}")
                     episode_error = True
+                    if isinstance(e, VLMCallError):
+                        self.vlm_agent.errors.append(f"guidance: {e}")
+                    # Grounding falls back to empty masks, so its errors surface later as other exceptions
+                    trial['outcome'] = 'vlm_error' if any(c.errors for c in vlm_clients) else 'prep_error'
+                    trial['error'] = str(e)
                     # Save error info
                     error_file = os.path.join(episode_dir, 'error.txt')
                     with open(error_file, 'w') as f:
                         import traceback
                         f.write(f"Error during episode preparation:\n{traceback.format_exc()}")
                 # Reset stage manager
-            
+
             # Skip this episode if preparation failed
             if episode_error:
                 log.warning(f"Skipping episode {episode+1} due to preparation error")
                 # Save a placeholder fail video/marker
                 fail_marker = os.path.join(episode_dir, f'episode_{episode+1}_fail_error.txt')
                 with open(fail_marker, 'w') as f:
-                    f.write("Episode failed due to guidance function error\n")
+                    f.write(f"Episode failed during preparation ({trial['outcome']}): {trial['error']}\n")
+                self._record_trial(trials, trial, vlm_clients)
                 continue
-            
+
             # Wrap entire episode execution in try-except
+            successes_before = self.success_count
             try:
                 self._run_episode(episode, episode_dir)
+                trial['outcome'] = 'success' if self.success_count > successes_before else 'fail'
             except Exception as e:
+                trial['outcome'], trial['error'] = 'execution_error', str(e)
                 log.error(f"Episode {episode+1} execution failed: {e}")
                 import traceback
                 error_file = os.path.join(episode_dir, 'error.txt')
@@ -513,18 +544,34 @@ class Main:
                 with open(fail_marker, 'w') as f:
                     f.write(f"Episode failed due to execution error: {e}\n")
                 log.warning(f"Skipping episode {episode+1} due to execution error")
-                continue
-        
+            self._record_trial(trials, trial, vlm_clients)
+
         # Final statistics
         success_rate = self.success_count / episode_num * 100
         log.info(f"Tested {episode_num} episodes, success rate: {success_rate:.2f}%")
-        
+        vlm_error_trials = [t['episode'] for t in trials if t['outcome'] == 'vlm_error']
+        failed_with_vlm_errors = [t['episode'] for t in trials if t['outcome'] != 'success' and t['vlm_errors']]
+
         # Save results
         log_file = os.path.join(self.output_dir, 'results.txt')
         with open(log_file, 'a') as f:
             f.write(f"Backend: {self.backend}\n")
             f.write(f"Success count: {self.success_count}/{episode_num}\n")
             f.write(f"Success rate: {success_rate:.2f}%\n")
+            f.write(f"Outcomes: {dict(Counter(t['outcome'] for t in trials))}\n")
+            f.write(f"Trials skipped by VLM call errors: {len(vlm_error_trials)} {vlm_error_trials}\n")
+            f.write(f"Unsuccessful trials with any VLM call error: {len(failed_with_vlm_errors)} {failed_with_vlm_errors}\n")
+            f.write("Per-trial details: trials.jsonl\n")
+
+    def _record_trial(self, trials: list, trial: dict, vlm_clients: list):
+        """Attach this trial's VLM call errors and append it to trials.jsonl (written per trial, so it survives crashes)."""
+        trial['vlm_errors'] = [err for c in vlm_clients for err in c.errors]
+        trials.append(trial)
+        if trial['vlm_errors']:
+            log.warning(f"Episode {trial['episode']} ({trial['outcome']}) had {len(trial['vlm_errors'])} VLM call error(s): "
+                        f"{trial['vlm_errors']}")
+        with open(os.path.join(self.output_dir, 'trials.jsonl'), 'a') as f:
+            f.write(json.dumps(trial) + "\n")
 
     def _run_episode(self, episode: int, episode_dir: str):
         """Run a single episode with the current configuration."""

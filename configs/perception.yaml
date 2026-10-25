@@ -21,10 +21,13 @@ keypoint_detector:
 # ============================================================
 # VLM Agent (for guidance generation)
 # ============================================================
+# Available models (set provider + model; same choices apply to the stage recognizer below):
+#   Qwen 3.8 Flash (local vLLM):  provider: openai,      model: qwen3.8-flash,   base_url: http://192.168.42.135:8000/v1
+#   Claude Opus 5.5 (Claude Code): provider: claude_code, model: claude-opus-5-5  (base_url / api_key / temperature ignored)
 vlm_agent:
-  provider: openai          # openai (any OpenAI-compatible endpoint), or claude_code (Claude via local Claude Code login; model e.g. opus/sonnet)
+  provider: claude_code          # openai (any OpenAI-compatible endpoint), or claude_code (Claude via local Claude Code login)
   base_url: http://192.168.42.135:8000/v1           # Set AZURE_OPENAI_BASE_URL env var (for Azure) or leave null for OpenAI
-  model: qwen3.8-flash           # Use gpt-4o, gpt-4, gpt-4-turbo, or gpt-3.5-turbo
+  model: claude-opus-5-5           # qwen3.8-flash (openai provider) or claude-opus-5-5 (claude_code provider)
   api_key: EMPTY             # Overrides OPENAI_API_KEY env var; set null to use the env var (e.g. real OpenAI)
   temperature: 1.0
   max_completion_tokens: 8000
@@ -36,14 +39,22 @@ vlm_agent:
 # ============================================================
 sam3:
   enabled: false            # SAM3 can't detect small objects well
+  version: sam3.1           # sam3 or sam3.1 (facebook/sam3.1 image detector); auto-downloaded from HuggingFace
+  model_path: null          # Optional local checkpoint; overrides version
+  score_threshold: 0.5
+  # Only used when the env adapter provides no segmentation and grounding is off (see gemini_grounding)
 
 # ============================================================
 # Gemini Grounding (preferred for visual grounding)
 # ============================================================
+# Only used when the env adapter provides no segmentation (realworld backend; LIBERO/CALVIN use sim masks)
 gemini_grounding:
   enabled: true
-  api_key: null             # Set GOOGLE_API_KEY env var
-  model: gemini-3-flash-preview
+  provider: claude_code     # gemini, openai (any OpenAI-compatible server), or claude_code; same keys as the stage recognizer below
+  base_url: http://192.168.42.135:8000/v1  # openai provider only
+  api_key: null             # Set GOOGLE_API_KEY (gemini) or OPENAI_API_KEY (openai) env var
+  model: claude-opus-5-5    # gemini-3-flash-preview (gemini), qwen3.8-flash (openai), or claude-opus-5-5 (claude_code)
+  reasoning_effort: medium  # openai / claude_code providers
   
   # Default objects to detect (overridden per task)
   default_objects:
@@ -59,10 +70,10 @@ gemini_grounding:
 # Gemini Stage Recognition (for real-time stage + guidance decisions)
 # ============================================================
 gemini:
-  provider: openai          # gemini, openai (any OpenAI-compatible server, e.g. local vLLM), or claude_code
+  provider: claude_code     # gemini, openai (any OpenAI-compatible server, e.g. local vLLM), or claude_code
   base_url: http://192.168.42.135:8000/v1            # openai provider only, e.g. http://192.168.42.135:8000/v1
   api_key: null             # Set GOOGLE_API_KEY (gemini) or OPENAI_API_KEY (openai) env var
-  model: qwen3.8-flash  # Fast model for real-time queries
+  model: claude-opus-5-5  # Fast model for real-time queries: qwen3.8-flash (openai) or claude-opus-5-5 (claude_code); see vlm_agent above
   max_completion_tokens: 4000    # openai provider only; leave room for reasoning tokens
   reasoning_effort: medium       # openai / claude_code providers; same values as vlm_agent.reasoning_effort
 

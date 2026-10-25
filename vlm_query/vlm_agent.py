@@ -18,6 +18,10 @@ from utils.logging_utils import SteerLogger
 from vlm_query.claude_code_client import query_claude_code
 log = SteerLogger("VLMAgent")
 
+
+class VLMCallError(RuntimeError):
+    """A VLM query failed or returned no text (as opposed to a task failure)."""
+
 # Function to encode the image
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
@@ -35,6 +39,8 @@ class VLMAgent:
 
         # 'openai' (any OpenAI-compatible endpoint) or 'claude_code' (Claude via the local Claude Code login)
         self.provider = config.get('provider', 'openai')
+        # Failed VLM calls (message strings), read and reset per trial by main.py like the grounder's
+        self.errors = []
         if self.provider == 'claude_code':
             log.info(f"Using Claude Code with model: {config['model']}")
         elif self.provider != 'openai':
@@ -247,26 +253,35 @@ class VLMAgent:
         cv2.imwrite(image_path, img[..., ::-1])
         # build prompt
         messages = self._build_prompt(image_path, instruction, save_dir=self.task_dir, **metadata)
-        if self.provider == 'claude_code':
-            start = time.time()
-            output = query_claude_code(messages[0]['content'], self.config['model'], self.config.get('reasoning_effort'))
-            print(f'[{time.time()-start:.2f}s] Querying Claude Code...Done')
-        else:
-            # stream back the response
-            stream = self.client.chat.completions.create(model=self.config['model'],
-                                                            messages=messages,
-                                                            temperature=self.config['temperature'],
-                                                            max_completion_tokens=self.config['max_completion_tokens'],
-                                                            stream=True,
-                                                            **self.effort_kwargs)
-            output = ""
-            start = time.time()
-            for chunk in stream:
-                print(f'[{time.time()-start:.2f}s] Querying OpenAI API...', end='\r')
-                if chunk.choices and len(chunk.choices) > 0:
-                    if chunk.choices[0].delta.content is not None:
-                        output += chunk.choices[0].delta.content
-            print(f'[{time.time()-start:.2f}s] Querying OpenAI API...Done')
+        finish_reason = None
+        try:
+            if self.provider == 'claude_code':
+                start = time.time()
+                output = query_claude_code(messages[0]['content'], self.config['model'], self.config.get('reasoning_effort'))
+                print(f'[{time.time()-start:.2f}s] Querying Claude Code...Done')
+            else:
+                # stream back the response
+                stream = self.client.chat.completions.create(model=self.config['model'],
+                                                                messages=messages,
+                                                                temperature=self.config['temperature'],
+                                                                max_completion_tokens=self.config['max_completion_tokens'],
+                                                                stream=True,
+                                                                **self.effort_kwargs)
+                output = ""
+                start = time.time()
+                for chunk in stream:
+                    print(f'[{time.time()-start:.2f}s] Querying OpenAI API...', end='\r')
+                    if chunk.choices and len(chunk.choices) > 0:
+                        if chunk.choices[0].delta.content is not None:
+                            output += chunk.choices[0].delta.content
+                        finish_reason = chunk.choices[0].finish_reason or finish_reason
+                print(f'[{time.time()-start:.2f}s] Querying OpenAI API...Done')
+        except Exception as e:
+            raise VLMCallError(f"{self.provider} guidance query to {self.config['model']} failed: {e}") from e
+        if not output.strip():
+            # e.g. finish_reason=length: a reasoning model spent the whole token budget thinking
+            raise VLMCallError(f"{self.provider} guidance query to {self.config['model']} returned no text "
+                               f"(finish_reason={finish_reason})")
         # save raw output
         with open(os.path.join(self.task_dir, 'output_raw.txt'), 'w') as f:
             f.write(output)
@@ -412,6 +427,7 @@ class VLMAgent:
 
         except Exception as e:
             log.warning(f"Error in segmentation planning: {e}")
+            self.errors.append(f"segmentation planning: {e}")
             return None
         finally:
             if os.path.exists(image_path):

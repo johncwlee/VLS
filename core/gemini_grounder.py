@@ -19,45 +19,112 @@ from utils.logging_utils import SteerLogger
 logger = SteerLogger("GeminiGrounder")
 
 
-class GeminiGrounder:
+class _VLMClient:
     """
-    Use Gemini's visual grounding to detect objects and return bounding boxes.
+    Provider handling shared by the grounder and the stage recognizer.
 
-    Gemini can detect objects based on text descriptions and return
-    bounding boxes in [y_min, x_min, y_max, x_max] format (normalized 0-1000).
+    Config keys:
+        - provider: 'gemini' (default), 'openai' (any OpenAI-compatible server, e.g. vLLM),
+          or 'claude_code' (Claude via the local Claude Code login)
+        - api_key: API key (default: GOOGLE_API_KEY or OPENAI_API_KEY env var, by provider)
+        - base_url: OpenAI-compatible endpoint (openai provider only)
+        - model: Model name (default: gemini-2.5-flash)
+        - max_completion_tokens: Response token cap (openai provider only)
+        - reasoning_effort: Thinking effort, e.g. low/medium (openai / claude_code providers; null = model default)
     """
 
-    def __init__(self, config: dict):
-        """
-        Initialize Gemini grounder.
-
-        Args:
-            config: Configuration dict with:
-                - api_key: Google API key
-                - model: Model name (default: gemini-2.5-flash)
-        """
+    def _init_provider(self, config: dict):
         self.config = config
-        self.api_key = config.get('api_key') or os.environ.get('GOOGLE_API_KEY')
+        # Failed VLM calls (message strings); callers fall back to defaults, so main.py reads and resets this per trial
+        self.errors = []
+        self.provider = config.get('provider', 'gemini')
         self.model = config.get('model', 'gemini-2.5-flash')
-
-        if not self.api_key:
-            raise ValueError("Gemini API key required. Set 'api_key' in config or GOOGLE_API_KEY env var.")
-
+        if self.provider == 'gemini':
+            self.api_key = config.get('api_key') or os.environ.get('GOOGLE_API_KEY')
+            if not self.api_key:
+                raise ValueError("Gemini API key required. Set 'api_key' in config or GOOGLE_API_KEY env var.")
+        elif self.provider == 'openai':
+            # Local servers (vLLM) ignore the key, but the OpenAI client requires one.
+            self.api_key = config.get('api_key') or os.environ.get('OPENAI_API_KEY') or (
+                'EMPTY' if config.get('base_url') else None)
+            if not self.api_key:
+                raise ValueError("OpenAI API key required. Set 'api_key' or 'base_url' in config, or OPENAI_API_KEY env var.")
+        elif self.provider != 'claude_code':  # claude_code uses the local Claude Code login
+            raise ValueError(f"Unknown provider: {self.provider!r} (expected 'gemini', 'openai' or 'claude_code')")
         self._setup_client()
-        logger.info(f"GeminiGrounder initialized with model: {self.model}")
 
     def _setup_client(self):
-        """Setup Google Generative AI client."""
+        """Setup Google Generative AI client, or an OpenAI client for the openai provider."""
+        if self.provider == 'claude_code':
+            return
+        if self.provider == 'openai':
+            from openai import OpenAI
+            self.client = OpenAI(api_key=self.api_key, base_url=self.config.get('base_url'))
+            return
         try:
             import google.generativeai as genai
             genai.configure(api_key=self.api_key)
             self.client = genai.GenerativeModel(self.model)
-            logger.info("Gemini client initialized")
         except ImportError:
             raise ImportError(
                 "google-generativeai not installed. Install with:\n"
                 "  pip install google-generativeai"
             )
+
+    def _generate(self, content: list) -> str:
+        """Send a Gemini-style content list (str / PIL images) to the configured provider; return the reply text."""
+        if self.provider == 'openai':
+            return self._generate_openai(content)
+        if self.provider == 'claude_code':
+            from vlm_query.claude_code_client import query_claude_code
+            return query_claude_code(self._to_openai_parts(content), self.model,
+                                     self.config.get('reasoning_effort')).strip()
+        return self.client.generate_content(content).text.strip()
+
+    @staticmethod
+    def _to_openai_parts(content: list) -> list:
+        """Convert the Gemini-style content list (str / PIL images) to OpenAI content parts."""
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append({"type": "text", "text": item})
+            else:
+                buffer = io.BytesIO()
+                item.save(buffer, format='PNG')
+                url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode('utf-8')
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+        return parts
+
+    def _generate_openai(self, content: list) -> str:
+        """Send the Gemini-style content list as one OpenAI chat message."""
+        # Only sent when set: non-reasoning models reject the parameter
+        effort = self.config.get('reasoning_effort')
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": self._to_openai_parts(content)}],
+            max_completion_tokens=self.config.get('max_completion_tokens', 4000),
+            **({'reasoning_effort': effort} if effort else {}),
+        )
+        return (response.choices[0].message.content or "").strip()
+
+
+class GeminiGrounder(_VLMClient):
+    """
+    Use a VLM's visual grounding to detect objects and return bounding boxes.
+
+    The model detects objects based on text descriptions and returns
+    bounding boxes in [y_min, x_min, y_max, x_max] format (normalized 0-1000).
+    """
+
+    def __init__(self, config: dict):
+        """
+        Initialize grounder.
+
+        Args:
+            config: Configuration dict; see _VLMClient for provider keys.
+        """
+        self._init_provider(config)
+        logger.info(f"GeminiGrounder initialized with {self.provider} model: {self.model}")
 
     def _image_to_base64(self, rgb: np.ndarray) -> str:
         """Convert numpy RGB image to base64."""
@@ -83,8 +150,6 @@ class GeminiGrounder:
         Returns:
             List of dicts with 'label', 'box_2d' (normalized 0-1000), 'box_pixel' (actual pixels)
         """
-        import google.generativeai as genai
-
         H, W = rgb.shape[:2]
 
         # Build prompt
@@ -106,8 +171,7 @@ Only return the JSON array, no other text. If an object is not found, don't incl
         img = Image.fromarray(rgb)
 
         try:
-            response = self.client.generate_content([prompt, img])
-            response_text = response.text.strip()
+            response_text = self._generate([prompt, img])
 
             # Parse JSON from response
             # Handle markdown code blocks
@@ -128,11 +192,12 @@ Only return the JSON array, no other text. If an object is not found, don't incl
                     int(box[3] * W / 1000),  # x_max
                 ]
 
-            logger.info(f"Gemini detected {len(detections)} objects: {[d['label'] for d in detections]}")
+            logger.info(f"[{self.provider}] detected {len(detections)} objects: {[d['label'] for d in detections]}")
             return detections
 
         except Exception as e:
-            logger.error(f"Gemini detection failed: {e}")
+            logger.error(f"{self.provider} detection failed: {e}")
+            self.errors.append(f"grounding: {e}")
             return []
 
     def detect_to_segmentation(
@@ -212,42 +277,19 @@ def create_gemini_grounder(config: dict) -> GeminiGrounder:
     return GeminiGrounder(config)
 
 
-class GeminiStageRecognizer:
+class GeminiStageRecognizer(_VLMClient):
     """
-    Use Gemini to recognize current stage and decide whether guidance is needed.
+    Use a VLM to recognize current stage and decide whether guidance is needed.
     """
-    
+
     def __init__(self, config: dict):
         """
-        Initialize Gemini stage recognizer.
-        
+        Initialize stage recognizer.
+
         Args:
-            config: Configuration dict with:
-                - provider: 'gemini' (default), 'openai' (any OpenAI-compatible server, e.g. vLLM),
-                  or 'claude_code' (Claude via the local Claude Code login)
-                - api_key: API key (default: GOOGLE_API_KEY or OPENAI_API_KEY env var, by provider)
-                - base_url: OpenAI-compatible endpoint (openai provider only)
-                - model: Model name (default: gemini-2.5-flash)
-                - max_completion_tokens: Response token cap (openai provider only)
-                - reasoning_effort: Thinking effort, e.g. low/medium (openai / claude_code providers; null = model default)
+            config: Configuration dict; see _VLMClient for provider keys, plus:
                 - stage_template_path: Path to prompt template (optional)
         """
-        self.config = config
-        self.provider = config.get('provider', 'gemini')
-        self.model = config.get('model', 'gemini-2.5-flash')
-        if self.provider == 'gemini':
-            self.api_key = config.get('api_key') or os.environ.get('GOOGLE_API_KEY')
-            if not self.api_key:
-                raise ValueError("Gemini API key required. Set 'api_key' in config or GOOGLE_API_KEY env var.")
-        elif self.provider == 'openai':
-            # Local servers (vLLM) ignore the key, but the OpenAI client requires one.
-            self.api_key = config.get('api_key') or os.environ.get('OPENAI_API_KEY') or (
-                'EMPTY' if config.get('base_url') else None)
-            if not self.api_key:
-                raise ValueError("OpenAI API key required. Set 'api_key' or 'base_url' in config, or OPENAI_API_KEY env var.")
-        elif self.provider != 'claude_code':  # claude_code uses the local Claude Code login
-            raise ValueError(f"Unknown stage recognizer provider: {self.provider!r} (expected 'gemini', 'openai' or 'claude_code')")
-        
         # Load prompt template
         template_path = config.get('stage_template_path')
         if template_path is None:
@@ -257,28 +299,10 @@ class GeminiStageRecognizer:
         
         with open(template_path, 'r') as f:
             self.prompt_template = f.read()
-        
-        self._setup_client()
+
+        self._init_provider(config)
         logger.info(f"GeminiStageRecognizer initialized with {self.provider} model: {self.model}")
 
-    def _setup_client(self):
-        """Setup Google Generative AI client, or an OpenAI client for the openai provider."""
-        if self.provider == 'claude_code':
-            return
-        if self.provider == 'openai':
-            from openai import OpenAI
-            self.client = OpenAI(api_key=self.api_key, base_url=self.config.get('base_url'))
-            return
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self.client = genai.GenerativeModel(self.model)
-        except ImportError:
-            raise ImportError(
-                "google-generativeai not installed. Install with:\n"
-                "  pip install google-generativeai"
-            )
-    
     def identify_stage_and_guidance(
         self, 
         current_rgb: np.ndarray, 
@@ -349,16 +373,10 @@ class GeminiStageRecognizer:
             content.append("**Current Image:**")
             content.append(current_img)
             
-            if self.provider == 'openai':
-                output = self._generate_openai(content)
-            elif self.provider == 'claude_code':
-                from vlm_query.claude_code_client import query_claude_code
-                output = query_claude_code(self._to_openai_parts(content), self.model,
-                                           self.config.get('reasoning_effort')).strip()
-            else:
-                response = self.client.generate_content(content)
-                output = response.text.strip()
-            
+            output = self._generate(content)
+            if not output:
+                raise ValueError(f"{self.model} returned no text")
+
             # Parse stage number
             import re
             stage_match = re.search(r'stage\s+(\d+)', output.lower())
@@ -382,33 +400,8 @@ class GeminiStageRecognizer:
 
         except Exception as e:
             logger.error(f"{self.provider} stage recognition failed: {e}")
+            self.errors.append(f"stage recognition: {e}")
             return 1, True
-
-    @staticmethod
-    def _to_openai_parts(content: list) -> list:
-        """Convert the Gemini-style content list (str / PIL images) to OpenAI content parts."""
-        parts = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append({"type": "text", "text": item})
-            else:
-                buffer = io.BytesIO()
-                item.save(buffer, format='PNG')
-                url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode('utf-8')
-                parts.append({"type": "image_url", "image_url": {"url": url}})
-        return parts
-
-    def _generate_openai(self, content: list) -> str:
-        """Send the Gemini-style content list as one OpenAI chat message."""
-        # Only sent when set: non-reasoning models reject the parameter
-        effort = self.config.get('reasoning_effort')
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": self._to_openai_parts(content)}],
-            max_completion_tokens=self.config.get('max_completion_tokens', 4000),
-            **({'reasoning_effort': effort} if effort else {}),
-        )
-        return (response.choices[0].message.content or "").strip()
 
 
 def create_gemini_stage_recognizer(config: dict) -> GeminiStageRecognizer:
