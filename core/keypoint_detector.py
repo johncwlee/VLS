@@ -35,18 +35,24 @@ from utils.logging_utils import SteerLogger
 
 logger = SteerLogger("KeypointDetector")
 
-# DINOv3 model variants (HuggingFace)
+# DINOv3 model variants (timm). Loaded via timm because transformers' DINOv3 needs >=4.56,
+# while pi05 requires the patched transformers 4.53 branch. The HF lvd1689m q/v biases are
+# all zero, so timm's bias-free variants are equivalent to facebook/dinov3-*-pretrain-lvd1689m.
 DINOV3_MODELS = {
-    'dinov3_vits16': 'facebook/dinov3-vits16-pretrain-lvd1689m',
-    'dinov3_vitb16': 'facebook/dinov3-vitb16-pretrain-lvd1689m',
-    'dinov3_vitl16': 'facebook/dinov3-vitl16-pretrain-lvd1689m',
-    'dinov3_vith16': 'facebook/dinov3-vith16-pretrain-lvd1689m',
-    'dinov3_vit7b16': 'facebook/dinov3-vit7b16-pretrain-lvd1689m',
-    'dinov3_convnext_tiny': 'facebook/dinov3-convnext-tiny-pretrain-lvd1689m',
-    'dinov3_convnext_small': 'facebook/dinov3-convnext-small-pretrain-lvd1689m',
-    'dinov3_convnext_base': 'facebook/dinov3-convnext-base-pretrain-lvd1689m',
-    'dinov3_convnext_large': 'facebook/dinov3-convnext-large-pretrain-lvd1689m',
+    'dinov3_vits16': 'vit_small_patch16_dinov3.lvd1689m',
+    'dinov3_vitb16': 'vit_base_patch16_dinov3.lvd1689m',
+    'dinov3_vitl16': 'vit_large_patch16_dinov3.lvd1689m',
+    'dinov3_vith16': 'vit_huge_plus_patch16_dinov3.lvd1689m',
+    'dinov3_vit7b16': 'vit_7b_patch16_dinov3.lvd1689m',
 }
+# Same preprocessing as the HF DINOv3 image processor: 224x224 resize + ImageNet norm.
+# NOTE: this squashes every frame to a 14x14 patch grid (aspect ratio lost), which is coarse
+# for keypoint clustering. timm's DINOv3 accepts any multiple-of-16 input, so feeding the
+# native-resolution frame (shape_info's patch_h x patch_w grid, like the DINOv2 path) would give
+# finer features. Kept at 224 to match the authors' HF-processor setup; changing it changes results.
+DINOV3_INPUT_SIZE = 224
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 # DINOv2 model variants (torch.hub)
 DINOV2_MODELS = {
@@ -121,32 +127,16 @@ class KeypointDetector:
         logger.info(f"DINOv2 model loaded: {model_name}")
 
     def _load_dinov3(self, model_name: str):
-        """Load DINOv3 model from HuggingFace."""
-        logger.info(f"Loading DINOv3 model: {DINOV3_MODELS[model_name]}")
+        """Load DINOv3 model from timm."""
+        import timm
+
+        timm_model_name = DINOV3_MODELS[model_name]
+        logger.info(f"Loading DINOv3 model: {timm_model_name}")
         self.feature_extractor_type = 'dinov3'
         self.patch_size = 16  # DINOv3 uses patch size 16
-
-        try:
-            from transformers import AutoImageProcessor, AutoModel
-
-            hf_model_name = DINOV3_MODELS[model_name]
-            self.dinov3_processor = AutoImageProcessor.from_pretrained(hf_model_name)
-            self.dino_model = AutoModel.from_pretrained(
-                hf_model_name,
-                torch_dtype=torch.float16 if 'cuda' in str(self.device) else torch.float32
-            ).eval().to(self.device)
-
-            logger.info(f"DINOv3 model loaded: {hf_model_name}")
-
-        except ImportError as e:
-            logger.error(
-                "transformers>=4.56.0 required for DINOv3. "
-                "Install with: pip install transformers>=4.56.0"
-            )
-            raise ImportError(f"Cannot load DINOv3: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to load DINOv3 ({e}), falling back to DINOv2")
-            self._load_dinov2('dinov2_vits14')
+        dtype = torch.float16 if 'cuda' in str(self.device) else torch.float32
+        self.dino_model = timm.create_model(timm_model_name, pretrained=True).eval().to(self.device, dtype)
+        logger.info(f"DINOv3 model loaded: {timm_model_name}")
     
     def get_keypoints(
         self, 
@@ -325,51 +315,21 @@ class KeypointDetector:
         return features_flat
 
     def _get_features_dinov3(self, transformed_rgb, img_h, img_w):
-        """Extract features using DINOv3 (HuggingFace transformers)."""
-        from PIL import Image
-        import math
+        """Extract features using DINOv3 (timm)."""
+        img = torch.from_numpy(transformed_rgb).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        img = interpolate(img, size=(DINOV3_INPUT_SIZE, DINOV3_INPUT_SIZE), mode='bilinear', antialias=True)
+        mean = torch.tensor(IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
+        std = torch.tensor(IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
+        img = ((img - mean) / std).to(next(self.dino_model.parameters()).dtype)
 
-        # Convert to uint8 PIL Image for the processor
-        rgb_uint8 = (transformed_rgb * 255).astype(np.uint8)
-        pil_image = Image.fromarray(rgb_uint8)
-
-        # Process image with DINOv3 processor
-        inputs = self.dinov3_processor(images=pil_image, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        # Get features
-        outputs = self.dino_model(**inputs)
-
-        # DINOv3 returns last_hidden_state with shape [1, num_patches + 1, feature_dim]
-        # The +1 is for the CLS token which we skip
-        features = outputs.last_hidden_state[:, 1:, :]  # Skip CLS token
-
-        num_patches = features.shape[1]
+        # Tokens are [CLS, 4 registers, patches...]; keep only the patch tokens
+        tokens = self.dino_model.forward_features(img)
+        features = tokens[:, self.dino_model.num_prefix_tokens:, :]
         feature_dim = features.shape[2]
 
-        # Infer patch grid dimensions from actual number of patches
-        processed_h = inputs['pixel_values'].shape[2]
-        processed_w = inputs['pixel_values'].shape[3]
-
-        # Calculate expected patches based on image size and patch size
-        patch_h = processed_h // self.patch_size
-        patch_w = processed_w // self.patch_size
-
-        # If that doesn't match, try to infer from num_patches (assume square-ish)
-        if patch_h * patch_w != num_patches:
-            # Try to find factors that work
-            patch_h = int(math.sqrt(num_patches))
-            patch_w = num_patches // patch_h
-            if patch_h * patch_w != num_patches:
-                # If still doesn't work, try closest square
-                patch_h = int(math.sqrt(num_patches))
-                patch_w = patch_h
-                # Truncate features if needed
-                num_patches = patch_h * patch_w
-                features = features[:, :num_patches, :]
-
         # Reshape to spatial grid
-        raw_feature_grid = features.reshape(1, patch_h, patch_w, feature_dim)
+        grid = DINOV3_INPUT_SIZE // self.patch_size
+        raw_feature_grid = features.reshape(1, grid, grid, feature_dim)
 
         # Interpolate to original image size
         interpolated_feature_grid = interpolate(
