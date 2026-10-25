@@ -98,3 +98,6 @@ results/
 
 # Output directory
 output/
+
+# Submodule checkouts, cloned by hand at the commits pinned in requirements.txt
+third_party/
