@@ -524,6 +524,7 @@ class Main:
                 fail_marker = os.path.join(episode_dir, f'episode_{episode+1}_fail_error.txt')
                 with open(fail_marker, 'w') as f:
                     f.write(f"Episode failed during preparation ({trial['outcome']}): {trial['error']}\n")
+                os.rename(episode_dir, f'{episode_dir}_failed')
                 self._record_trial(trials, trial, vlm_clients)
                 continue
 
@@ -544,6 +545,7 @@ class Main:
                 with open(fail_marker, 'w') as f:
                     f.write(f"Episode failed due to execution error: {e}\n")
                 log.warning(f"Skipping episode {episode+1} due to execution error")
+                os.rename(episode_dir, f'{episode_dir}_failed')
             self._record_trial(trials, trial, vlm_clients)
 
         # Final statistics

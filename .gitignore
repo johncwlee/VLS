@@ -75,7 +75,7 @@ wandb/
 lightning_logs/
 runs/
 checkpoints/
-outputs/
+outputs
 tensorboard/
 tb_logs/
 experiments/
