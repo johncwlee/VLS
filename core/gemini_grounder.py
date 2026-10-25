@@ -223,11 +223,13 @@ class GeminiStageRecognizer:
         
         Args:
             config: Configuration dict with:
-                - provider: 'gemini' (default) or 'openai' (any OpenAI-compatible server, e.g. vLLM)
+                - provider: 'gemini' (default), 'openai' (any OpenAI-compatible server, e.g. vLLM),
+                  or 'claude_code' (Claude via the local Claude Code login)
                 - api_key: API key (default: GOOGLE_API_KEY or OPENAI_API_KEY env var, by provider)
                 - base_url: OpenAI-compatible endpoint (openai provider only)
                 - model: Model name (default: gemini-2.5-flash)
                 - max_completion_tokens: Response token cap (openai provider only)
+                - reasoning_effort: Thinking effort, e.g. low/medium (openai / claude_code providers; null = model default)
                 - stage_template_path: Path to prompt template (optional)
         """
         self.config = config
@@ -243,8 +245,8 @@ class GeminiStageRecognizer:
                 'EMPTY' if config.get('base_url') else None)
             if not self.api_key:
                 raise ValueError("OpenAI API key required. Set 'api_key' or 'base_url' in config, or OPENAI_API_KEY env var.")
-        else:
-            raise ValueError(f"Unknown stage recognizer provider: {self.provider!r} (expected 'gemini' or 'openai')")
+        elif self.provider != 'claude_code':  # claude_code uses the local Claude Code login
+            raise ValueError(f"Unknown stage recognizer provider: {self.provider!r} (expected 'gemini', 'openai' or 'claude_code')")
         
         # Load prompt template
         template_path = config.get('stage_template_path')
@@ -261,6 +263,8 @@ class GeminiStageRecognizer:
 
     def _setup_client(self):
         """Setup Google Generative AI client, or an OpenAI client for the openai provider."""
+        if self.provider == 'claude_code':
+            return
         if self.provider == 'openai':
             from openai import OpenAI
             self.client = OpenAI(api_key=self.api_key, base_url=self.config.get('base_url'))
@@ -347,6 +351,10 @@ class GeminiStageRecognizer:
             
             if self.provider == 'openai':
                 output = self._generate_openai(content)
+            elif self.provider == 'claude_code':
+                from vlm_query.claude_code_client import query_claude_code
+                output = query_claude_code(self._to_openai_parts(content), self.model,
+                                           self.config.get('reasoning_effort')).strip()
             else:
                 response = self.client.generate_content(content)
                 output = response.text.strip()
@@ -376,8 +384,9 @@ class GeminiStageRecognizer:
             logger.error(f"{self.provider} stage recognition failed: {e}")
             return 1, True
 
-    def _generate_openai(self, content: list) -> str:
-        """Send the Gemini-style content list (str / PIL images) as one OpenAI chat message."""
+    @staticmethod
+    def _to_openai_parts(content: list) -> list:
+        """Convert the Gemini-style content list (str / PIL images) to OpenAI content parts."""
         parts = []
         for item in content:
             if isinstance(item, str):
@@ -387,10 +396,17 @@ class GeminiStageRecognizer:
                 item.save(buffer, format='PNG')
                 url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode('utf-8')
                 parts.append({"type": "image_url", "image_url": {"url": url}})
+        return parts
+
+    def _generate_openai(self, content: list) -> str:
+        """Send the Gemini-style content list as one OpenAI chat message."""
+        # Only sent when set: non-reasoning models reject the parameter
+        effort = self.config.get('reasoning_effort')
         response = self.client.chat.completions.create(
             model=self.model,
-            messages=[{"role": "user", "content": parts}],
+            messages=[{"role": "user", "content": self._to_openai_parts(content)}],
             max_completion_tokens=self.config.get('max_completion_tokens', 4000),
+            **({'reasoning_effort': effort} if effort else {}),
         )
         return (response.choices[0].message.content or "").strip()
 

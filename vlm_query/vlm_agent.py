@@ -15,6 +15,7 @@ import re
 from datetime import datetime
 
 from utils.logging_utils import SteerLogger
+from vlm_query.claude_code_client import query_claude_code
 log = SteerLogger("VLMAgent")
 
 # Function to encode the image
@@ -32,12 +33,21 @@ class VLMAgent:
         api_key = config.get('api_key') or os.environ.get('OPENAI_API_KEY') or os.environ.get('OPENAI_API_KEY')
         base_url = config.get('base_url') or os.environ.get('AZURE_OPENAI_BASE_URL')  # For Azure OpenAI
 
-        if base_url:
+        # 'openai' (any OpenAI-compatible endpoint) or 'claude_code' (Claude via the local Claude Code login)
+        self.provider = config.get('provider', 'openai')
+        if self.provider == 'claude_code':
+            log.info(f"Using Claude Code with model: {config['model']}")
+        elif self.provider != 'openai':
+            raise ValueError(f"Unknown VLM agent provider: {self.provider!r} (expected 'openai' or 'claude_code')")
+        elif base_url:
             self.client = OpenAI(api_key=api_key, base_url=base_url)
             log.info(f"Using custom OpenAI endpoint: {base_url}")
         else:
             self.client = OpenAI(api_key=api_key)
             log.info("Using standard OpenAI endpoint")
+        # Only sent when set: non-reasoning models reject the parameter
+        effort = config.get('reasoning_effort')
+        self.effort_kwargs = {'reasoning_effort': effort} if effort else {}
 
         self.base_dir = base_dir
         # self.task_dir = os.path.join(self.base_dir, "vlm_agent")
@@ -237,20 +247,26 @@ class VLMAgent:
         cv2.imwrite(image_path, img[..., ::-1])
         # build prompt
         messages = self._build_prompt(image_path, instruction, save_dir=self.task_dir, **metadata)
-        # stream back the response
-        stream = self.client.chat.completions.create(model=self.config['model'],
-                                                        messages=messages,
-                                                        temperature=self.config['temperature'],
-                                                        max_completion_tokens=self.config['max_completion_tokens'],
-                                                        stream=True)
-        output = ""
-        start = time.time()
-        for chunk in stream:
-            print(f'[{time.time()-start:.2f}s] Querying OpenAI API...', end='\r')
-            if chunk.choices and len(chunk.choices) > 0:
-                if chunk.choices[0].delta.content is not None:
-                    output += chunk.choices[0].delta.content
-        print(f'[{time.time()-start:.2f}s] Querying OpenAI API...Done')
+        if self.provider == 'claude_code':
+            start = time.time()
+            output = query_claude_code(messages[0]['content'], self.config['model'], self.config.get('reasoning_effort'))
+            print(f'[{time.time()-start:.2f}s] Querying Claude Code...Done')
+        else:
+            # stream back the response
+            stream = self.client.chat.completions.create(model=self.config['model'],
+                                                            messages=messages,
+                                                            temperature=self.config['temperature'],
+                                                            max_completion_tokens=self.config['max_completion_tokens'],
+                                                            stream=True,
+                                                            **self.effort_kwargs)
+            output = ""
+            start = time.time()
+            for chunk in stream:
+                print(f'[{time.time()-start:.2f}s] Querying OpenAI API...', end='\r')
+                if chunk.choices and len(chunk.choices) > 0:
+                    if chunk.choices[0].delta.content is not None:
+                        output += chunk.choices[0].delta.content
+            print(f'[{time.time()-start:.2f}s] Querying OpenAI API...Done')
         # save raw output
         with open(os.path.join(self.task_dir, 'output_raw.txt'), 'w') as f:
             f.write(output)
@@ -366,13 +382,19 @@ class VLMAgent:
         ]
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.config['model'],
-                messages=messages,
-                temperature=0.3,  # Lower temperature for consistent outputs
-                max_completion_tokens=200
-            )
-            output = response.choices[0].message.content.strip()
+            if self.provider == 'claude_code':
+                output = query_claude_code(messages[0]['content'], self.config['model'],
+                                           self.config.get('reasoning_effort')).strip()
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.config['model'],
+                    messages=messages,
+                    temperature=0.3,  # Lower temperature for consistent outputs
+                    # Reasoning tokens count toward this cap, so a small fixed cap leaves no room for the answer
+                    max_completion_tokens=self.config['max_completion_tokens'],
+                    **self.effort_kwargs,
+                )
+                output = response.choices[0].message.content.strip()
             log.info(f"[Segmentation Planning] VLM output: {output}")
 
             # Parse JSON output

@@ -18,6 +18,7 @@ cachetools==6.2.4
 -e git+ssh://git@github.com/Treeeplanter/calvin_env.git@bdb0e94b8710dd5b4ec7396ee2ce616c444a8d1b#egg=calvin_env&subdirectory=../../../../../third_party/calvin/calvin_env
 certifi==2025.10.5
 charset-normalizer==3.4.4
+claude-agent-sdk==0.2.163
 click==8.3.0
 click-help-colors==0.9.4
 click-option-group==0.5.9
