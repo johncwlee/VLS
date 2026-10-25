@@ -35,7 +35,8 @@ class SAM3Segmenter:
         Args:
             config: Configuration dictionary with keys:
                 - device: 'cuda' or 'cpu'
-                - model_path: Optional path to local checkpoint
+                - version: 'sam3' or 'sam3.1' (default: 'sam3'), downloaded from HuggingFace
+                - model_path: Optional path to local checkpoint (overrides version)
                 - score_threshold: Minimum confidence score (default: 0.5)
         """
         self.config = config
@@ -48,11 +49,17 @@ class SAM3Segmenter:
     def _load_model(self):
         """Load SAM3 model and processor."""
         try:
-            from sam3.model_builder import build_sam3_image_model
+            from sam3.model_builder import build_sam3_image_model, download_ckpt_from_hf
             from sam3.model.sam3_image_processor import Sam3Processor
 
-            logger.info("Loading SAM3 model...")
-            self.model = build_sam3_image_model()
+            version = self.config.get('version', 'sam3')
+            checkpoint_path = self.config.get('model_path') or download_ckpt_from_hf(version=version)
+            logger.info(f"Loading SAM3 model from {checkpoint_path}...")
+            # sam3.1 checkpoints lack the image neck's 0.5x level (vision_backbone.convs.3), so SAM3 prints
+            # them as missing keys. The image detector drops that level (scalp=1); the weights are never used.
+            self.model = build_sam3_image_model(
+                checkpoint_path=checkpoint_path, load_from_HF=False, device=str(self.device)
+            )
             self.processor = Sam3Processor(self.model)
             logger.info("SAM3 model loaded successfully")
 
@@ -64,6 +71,8 @@ class SAM3Segmenter:
             )
             raise ImportError(f"SAM3 not available: {e}")
 
+    # SAM3 runs in bf16 (upstream enables autocast globally); scope it to SAM3 so pi05 is unaffected
+    @torch.autocast("cuda", dtype=torch.bfloat16)
     def segment(
         self,
         rgb: np.ndarray,
@@ -118,7 +127,7 @@ class SAM3Segmenter:
                 if torch.is_tensor(masks):
                     masks = masks.cpu().numpy()
                 if torch.is_tensor(scores):
-                    scores = scores.cpu().numpy()
+                    scores = scores.float().cpu().numpy()  # bf16 under autocast; numpy has no bf16
 
                 # Handle different mask shapes - SAM3 may return various formats
                 # Common shapes: (H, W), (N, H, W), (N, 1, H, W), (1, N, H, W)
@@ -184,6 +193,7 @@ class SAM3Segmenter:
         logger.info(f"SAM3 segmented {current_id - 1} objects: {list(segment_id_to_name.values())[1:]}")
         return segmentation, segment_id_to_name
 
+    @torch.autocast("cuda", dtype=torch.bfloat16)
     def segment_with_boxes(
         self,
         rgb: np.ndarray,

@@ -50,6 +50,7 @@ fonttools==4.60.1
 freetype-py==2.5.1
 frozenlist==1.8.0
 fsspec==2025.3.0
+ftfy==6.1.1
 future==0.18.2
 gitdb==4.0.12
 GitPython==3.1.45
@@ -84,6 +85,7 @@ importlib_metadata==8.7.0
 importlib_resources==6.5.2
 iniconfig==2.3.0
 inquirerpy==0.3.4
+iopath==0.1.10
 ipython==9.7.0
 ipython_pygments_lexers==1.1.1
 jedi==0.19.2
@@ -146,6 +148,7 @@ pfzy==0.3.4
 pillow==12.0.0
 platformdirs==4.5.0
 pluggy==1.6.0
+portalocker==4.4.1
 prompt_toolkit==3.0.52
 propcache==0.4.1
 proto-plus==1.27.0
@@ -157,6 +160,7 @@ pyarrow==21.0.0
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
 pybullet==3.2.7
+pycocotools==2.0.11
 pycollada==0.6
 pydantic==2.12.2
 pydantic_core==2.41.4
@@ -186,6 +190,7 @@ rpds-py==0.30.0
 rsa==4.9.1
 safetensors==0.6.2
 sapien==3.0.1
+-e git+https://github.com/facebookresearch/sam3.git@f1647e8d0c1d280991f4d1b7d974c2704537fe66#egg=sam3
 scikit-learn==1.7.2
 scipy==1.16.3
 sentry-sdk==2.42.0
