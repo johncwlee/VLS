@@ -1,0 +1,20 @@
+# Steering parameters for CALVIN (diffusion policy), from the README and ablations/*.yaml.
+# Selected automatically from the backend choice (`guidance@main: ${backend}` in config.yaml).
+# guide_scale is not set here: the CALVIN adapter supplies it (80.0, or 120.0 for
+# precision tasks), overriding main.guide_scale.
+
+use_diversity: true
+sample_batch_size: 20  # particles; RBF diversity and FK resampling are no-ops at 1
+diversity_scale: 10.0
+MCMC_steps: 4
+
+sigmoid_k: 25.0
+sigmoid_x0: 0.75
+
+# FKD (Feynman-Kac Diffusion)
+use_fkd: true
+fkd:
+  potential_type: max
+  lmbda: 10.0
+  adaptive_resampling: true
+  resample_frequency: 5

@@ -10,6 +10,7 @@ defaults:
   - backend: libero              # Environment (calvin/libero/realworld)
   - perception               # Perception modules
   - policy                   # Policy config
+  - guidance@main: ${backend}  # Steering params per backend (configs/guidance/)
   - _self_
 
 # ============================================================
@@ -34,23 +35,9 @@ main:
   use_guidance: false
   use_vlm_stage_recognition: true  # Use Gemini to recognize current stage
   vlm_query_limit: 50  # Max VLM queries per episode
-  use_diversity: true
-  sample_batch_size: 1
-  guide_scale: 80.0
-  diversity_scale: 20.0
+  guide_scale: 80.0  # fallback only; the LIBERO/CALVIN adapters set it per task
   start_ratio: None
-  MCMC_steps: 4
-
-  sigmoid_k: 25.0
-  sigmoid_x0: 0.75
-  
-  # FKD (Feynman-Kac Diffusion)
-  use_fkd: true
-  fkd:
-    potential_type: max
-    lmbda: 10.0
-    adaptive_resampling: true
-    resample_frequency: 5
+  # Particle, diversity and FKD params: configs/guidance/<backend>.yaml
 
 # ============================================================
 # Experiment Tracking
