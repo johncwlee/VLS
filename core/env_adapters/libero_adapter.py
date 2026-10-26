@@ -736,13 +736,14 @@ class LiberoAdapter(BaseEnvAdapter):
         # LIBERO-PRO related attributes
         self.suite_name = env_config["suite_name"]
         self.task_num = len(self._env)
-        self.current_task_idx = 0  # Start with first task
 
         # total number of episodes to collect, must divide evenly by the number of tasks for desired suites
         self.total_episodes_num = env_config.get("episode_num", self.task_num)
         assert self.total_episodes_num % self.task_num == 0, f"episode_num ({self.total_episodes_num}) must divide evenly by the number of tasks ({self.task_num})"
         self.episodes_per_task = self.total_episodes_num // self.task_num
-        self.current_episode_idx = -1  # Will be incremented to 0 on first reset
+        # Incremented on each reset; resume (start_episode > 0) lands on that episode of the same task schedule
+        self.current_episode_idx = env_config.get("start_episode", 0) - 1
+        self.current_task_idx = (self.current_episode_idx + 1) // self.episodes_per_task % self.task_num
         
         # Cache for robot state and observations
         self._last_obs = None
@@ -1461,10 +1462,10 @@ class LiberoAdapter(BaseEnvAdapter):
         # Increment episode counter
         self.current_episode_idx += 1
         
-        # Check if we need to switch to next task
-        if self.current_episode_idx > 0 and self.current_episode_idx % self.episodes_per_task == 0:
-            # Move to next task (cycle back to 0 if at end)
-            self.current_task_idx = (self.current_task_idx + 1) % self.task_num
+        # Task follows the episode index: episodes_per_task consecutive episodes per task, cycling
+        task_idx = self.current_episode_idx // self.episodes_per_task % self.task_num
+        if task_idx != self.current_task_idx:
+            self.current_task_idx = task_idx
             log.info(f"Switching to task {self.current_task_idx} (episode {self.current_episode_idx})")
         
         # Reset episode step counter

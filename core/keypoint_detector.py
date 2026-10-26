@@ -21,8 +21,7 @@ import cv2
 import matplotlib.pyplot as plt
 from typing import Optional, Dict, Tuple, List
 from torch.nn.functional import interpolate
-from kmeans_pytorch import kmeans
-from sklearn.cluster import MeanShift
+from sklearn.cluster import KMeans, MeanShift
 
 from utils.keypoint_utils import (
     preprocess_for_dinov2,
@@ -409,14 +408,15 @@ class KeypointDetector:
             
             # the feature dimension contains both feature and pixel coordinates
             # cluster features to get meaningful regions
-            cluster_ids_x, cluster_centers = kmeans(
-                X=X,
-                num_clusters=self.config['num_candidates_per_mask'],
-                distance='euclidean',
-                device=self.device,
-            )
-            cluster_centers = cluster_centers.to(self.device)
-            for cluster_id in range(self.config['num_candidates_per_mask']):
+            X_np = X.cpu().numpy()
+            if len(np.unique(X_np, axis=0)) < num_clusters:
+                logger.warning(f"Mask {idx}: too few distinct points for clustering, skipping")
+                continue
+            # sklearn caps iterations and relocates empty clusters; kmeans_pytorch looped forever on NaN centers
+            km = KMeans(n_clusters=num_clusters).fit(X_np)
+            cluster_ids_x = torch.from_numpy(km.labels_)
+            cluster_centers = torch.from_numpy(km.cluster_centers_).to(self.device)
+            for cluster_id in range(num_clusters):
                 cluster_center = cluster_centers[cluster_id][:3]
                 member_idx = cluster_ids_x == cluster_id
                 member_points = feature_points[member_idx]

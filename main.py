@@ -123,6 +123,9 @@ class Main:
         
         # Add main.episode_num to env_config for adapters that need it (e.g., LiberoAdapter)
         env_config['episode_num'] = self.config.get('episode_num', 10)
+        env_config['start_episode'] = self.config.get('start_episode', 0)
+        if not 0 <= env_config['start_episode'] < env_config['episode_num']:
+            raise ValueError(f"start_episode ({env_config['start_episode']}) must be in [0, episode_num={env_config['episode_num']})")
 
         # Create adapter
         self.adapter = create_adapter(self.backend, env_config)
@@ -477,7 +480,8 @@ class Main:
         trials = []
         vlm_clients = [c for c in (self.gemini_grounder, self.gemini_stage_recognizer, self.vlm_agent) if c is not None]
 
-        for episode in range(episode_num):
+        start_episode = self.config.get('start_episode', 0)
+        for episode in range(start_episode, episode_num):
             for client in vlm_clients:
                 client.errors.clear()
             episode_seed = torch.randint(0, 1000, (1,)).item()
@@ -549,8 +553,9 @@ class Main:
             self._record_trial(trials, trial, vlm_clients)
 
         # Final statistics
-        success_rate = self.success_count / episode_num * 100
-        log.info(f"Tested {episode_num} episodes, success rate: {success_rate:.2f}%")
+        episodes_run = episode_num - start_episode
+        success_rate = self.success_count / episodes_run * 100
+        log.info(f"Tested {episodes_run} episodes, success rate: {success_rate:.2f}%")
         vlm_error_trials = [t['episode'] for t in trials if t['outcome'] == 'vlm_error']
         failed_with_vlm_errors = [t['episode'] for t in trials if t['outcome'] != 'success' and t['vlm_errors']]
 
@@ -558,7 +563,7 @@ class Main:
         log_file = os.path.join(self.output_dir, 'results.txt')
         with open(log_file, 'a') as f:
             f.write(f"Backend: {self.backend}\n")
-            f.write(f"Success count: {self.success_count}/{episode_num}\n")
+            f.write(f"Success count: {self.success_count}/{episodes_run}\n")
             f.write(f"Success rate: {success_rate:.2f}%\n")
             f.write(f"Outcomes: {dict(Counter(t['outcome'] for t in trials))}\n")
             f.write(f"Trials skipped by VLM call errors: {len(vlm_error_trials)} {vlm_error_trials}\n")

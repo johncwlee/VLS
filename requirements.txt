@@ -98,7 +98,6 @@ jsonschema-specifications==2025.9.1
 jupyter_core==5.9.1
 jupytext==1.18.1
 kiwisolver==1.4.9
-kmeans-pytorch==0.3
 -e git+https://github.com/Treeeplanter/lerobot.git@fbf0fb1e6a39a9223b61fcd09aead75c95363194#egg=lerobot&subdirectory=../../../third_party/lerobot
 -e git+ssh://git@github.com/Treeeplanter/LIBERO-PRO.git@6adba85c03663a7dac0df22ae54dbcf069f55623#egg=libero&subdirectory=../../../third_party/libero_pro
 llvmlite==0.45.1

@@ -23,6 +23,7 @@ seed: 0
 # ============================================================
 main:
   episode_num: 10  # if using libero, need to be divisible by the number of tasks in the suite(i.e. libero_goal_task has 10 tasks, so episode_num should be divisible by 10)
+  start_episode: 0  # resume: skip the first N episodes (N = "episode" of the last line in trials.jsonl); stats cover only the episodes run
   output_dir: ${hydra:run.dir}
   cached_functions_dir: null
   visualize_trajectory: false
