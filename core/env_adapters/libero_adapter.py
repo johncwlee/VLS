@@ -1429,7 +1429,7 @@ class LiberoAdapter(BaseEnvAdapter):
         action_numpy: np.ndarray = action.to("cpu").numpy()
 
         # Convert gripper action to binary (-1 or 1)
-        action[-1] = 1 if action[-1] > 0 else -1
+        action_numpy[-1] = 1 if action_numpy[-1] > 0 else -1
 
         current_env = self._env[self.current_task_idx]
         observation, reward, terminated, truncated, info = current_env.step(action_numpy)
