@@ -27,12 +27,11 @@ main:
   start_episode: 0  # resume: skip the first N episodes (N = "episode" of the last line in trials.jsonl); stats cover only the episodes run
   output_dir: ${hydra:run.dir}
   cached_functions_dir: null
-  visualize_trajectory: false
-  debug_draw_trajectory: false
+  debug_draw_trajectory: true
   render: false
   
   # Steering parameters
-  use_guidance: false
+  use_guidance: true
   use_vlm_stage_recognition: true  # Use Gemini to recognize current stage
   vlm_query_limit: 50  # Max VLM queries per episode
   guide_scale: 80.0  # fallback only; the LIBERO/CALVIN adapters set it per task

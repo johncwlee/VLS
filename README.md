@@ -286,7 +286,6 @@ Enable visualizations for debugging:
 
 ```yaml
 main:
-  visualize_trajectory: true
   debug_draw_trajectory: true
   render: true  # Show GUI if supported
 ```
@@ -319,7 +318,7 @@ tail -f results/TIMESTAMP/run.log
 **Issue: Slow execution**
 - Reduce `sample_batch_size`
 - Reduce `MCMC_steps`
-- Set `visualize_trajectory: false`
+- Set `debug_draw_trajectory: false`
 - Use smaller image sizes in env config
 
 ## Citation
