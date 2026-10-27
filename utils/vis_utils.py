@@ -321,8 +321,20 @@ def draw_action_trajectory_on_vlm_image(
         (0, 0, 255),     # Red
         (255, 128, 0),   # Orange
         (128, 0, 255),   # Purple
+        (0, 128, 255),   # Sky blue
+        (128, 255, 0),   # Lime
+        (255, 0, 128),   # Pink
+        (0, 255, 128),   # Spring green
+        (255, 128, 128), # Salmon
+        (128, 128, 255), # Periwinkle
+        (128, 255, 128), # Mint
+        (255, 255, 128), # Pale yellow
+        (128, 255, 255), # Pale cyan
+        (255, 128, 255), # Light magenta
+        (128, 64, 0),    # Brown
+        (255, 255, 255), # White
     ]
-    
+
     # Get VLM image from adapter
     # For LIBERO: use raw (unflipped) image for projection, then flip result
     if hasattr(adapter, 'get_vlm_image_raw'):
