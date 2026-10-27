@@ -133,7 +133,7 @@ class KeypointDetector:
         logger.info(f"Loading DINOv3 model: {timm_model_name}")
         self.feature_extractor_type = 'dinov3'
         self.patch_size = 16  # DINOv3 uses patch size 16
-        dtype = torch.float16 if 'cuda' in str(self.device) else torch.float32
+        dtype = torch.bfloat16 if 'cuda' in str(self.device) else torch.float32
         self.dino_model = timm.create_model(timm_model_name, pretrained=True).eval().to(self.device, dtype)
         logger.info(f"DINOv3 model loaded: {timm_model_name}")
     
@@ -272,7 +272,7 @@ class KeypointDetector:
         return candidate_keypoints, projected, candidate_rigid_group_ids
 
     @torch.inference_mode()
-    @torch.amp.autocast('cuda')
+    @torch.amp.autocast('cuda', dtype=torch.bfloat16)
     def _get_features(self, transformed_rgb, shape_info):
         """
         Extract features using DINOv2 or DINOv3.
