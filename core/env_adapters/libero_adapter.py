@@ -722,6 +722,61 @@ def create_libero_envs(
     return out
 
 
+def ee_step_motion(deltas: torch.Tensor, kind: str, env_config: dict, last_motion: dict) -> torch.Tensor:
+    """
+    Predicted per-step EE motion (T, 3) for normalized OSC deltas (T, 3); kind is 'pos' (metres)
+    or 'rot' (world-frame axis-angle, radians). env_config['ee_prediction'] selects the model:
+
+    constant: motion_t = action_scale * action_t (VLS's original model)
+    lag:      motion_t = gain * action_t + lag * motion_(t-1), per axis, seeded with the last executed
+              step's measured motion (last_motion). The OSC arm covers only part of each commanded step
+              and keeps moving, which a constant scale cannot capture (fit: scripts/calibrate_ee_model.py).
+    """
+    if env_config.get('ee_prediction', 'constant') == 'constant':
+        default_scale = 0.01 if kind == 'pos' else 0.1
+        return deltas * env_config.get(f'action_scale_{kind}', default_scale)
+
+    model = env_config['ee_lag_model']
+    gain = torch.as_tensor(model[f'{kind}_gain'], device=deltas.device, dtype=deltas.dtype)
+    lag = torch.as_tensor(model[f'{kind}_lag'], device=deltas.device, dtype=deltas.dtype)
+    motion = torch.as_tensor(last_motion[kind], device=deltas.device, dtype=deltas.dtype)
+    motions = []
+    for t in range(deltas.shape[-2]):  # time steps; any leading batch dims are vectorized
+        motion = gain * deltas[..., t, :] + lag * motion
+        motions.append(motion)
+    return torch.stack(motions, dim=-2)
+
+
+def predict_ee_positions(actions: torch.Tensor, start_pos: torch.Tensor, env_config: dict,
+                         last_motion: dict) -> torch.Tensor:
+    """(..., T+1, 3) predicted EE positions for (..., T, >=3) OSC delta actions from start_pos (differentiable)."""
+    delta_positions = ee_step_motion(actions[..., :3], 'pos', env_config, last_motion)
+    start = start_pos.expand(*delta_positions.shape[:-2], 1, 3)
+    return torch.cat([start, start + torch.cumsum(delta_positions, dim=-2)], dim=-2)
+
+
+def predict_ee_poses(actions: torch.Tensor, start_pos: torch.Tensor, start_rot: torch.Tensor, env_config: dict,
+                     last_motion: dict) -> torch.Tensor:
+    """
+    (..., T+1, 4, 4) predicted world-frame EE poses for (..., T, >=6) OSC delta actions (differentiable);
+    leading batch dims (e.g. particles) share start_pos / start_rot and are vectorized.
+
+    Orientations follow robosuite's OSC goal update (utils/control_utils.set_goal_orientation):
+    R_next = Exp(axis_angle_motion) @ R, i.e. the rotation delta is applied in the world frame.
+    """
+    from pytorch_kinematics.transforms import axis_angle_to_quaternion, quaternion_to_matrix
+
+    positions = predict_ee_positions(actions, start_pos, env_config, last_motion)
+    delta_rots = quaternion_to_matrix(axis_angle_to_quaternion(ee_step_motion(actions[..., 3:6], 'rot', env_config, last_motion)))
+    rotations = [start_rot.expand(*delta_rots.shape[:-3], 3, 3)]
+    for t in range(delta_rots.shape[-3]):
+        rotations.append(delta_rots[..., t, :, :] @ rotations[-1])
+    poses = torch.eye(4, device=actions.device, dtype=actions.dtype).repeat(*positions.shape[:-1], 1, 1)
+    poses[..., :3, :3] = torch.stack(rotations, dim=-3)
+    poses[..., :3, 3] = positions
+    return poses
+
+
 class LiberoAdapter(BaseEnvAdapter):
     def __init__(self, env: None, env_config: dict, device: str = "cuda"):
         super().__init__(env, env_config, device)
@@ -743,6 +798,7 @@ class LiberoAdapter(BaseEnvAdapter):
         self.episodes_per_task = self.total_episodes_num // self.task_num
         # Incremented on each reset; resume (start_episode > 0) lands on that episode of the same task schedule
         self.current_episode_idx = env_config.get("start_episode", 0) - 1
+        self._last_ee_motion = {'pos': np.zeros(3), 'rot': np.zeros(3)}
         self.current_task_idx = (self.current_episode_idx + 1) // self.episodes_per_task % self.task_num
         
         # Cache for robot state and observations
@@ -882,12 +938,7 @@ class LiberoAdapter(BaseEnvAdapter):
         Get end-effector pose in robot base frame.
         For LIBERO, robot base is at world origin, so this is the same as world pose.
         """
-        robosuite_env = self._get_current_robosuite_env()
-        robot = robosuite_env.robots[0]
-        controller = robot.controller
-        
-        pos = controller.ee_pos.copy()
-        ori_mat = controller.ee_ori_mat.copy()
+        pos, ori_mat = self._measure_ee()
         
         # Convert rotation matrix to quaternion (wxyz format)
         from scipy.spatial.transform import Rotation as R
@@ -1116,6 +1167,22 @@ class LiberoAdapter(BaseEnvAdapter):
         
         return objects
     
+    def get_objects_of_interest_heights(self) -> Dict[str, float]:
+        """
+        Evaluation only, never given to the policy or the VLM: world z of the task's objects of interest
+        (LIBERO bddl obj_of_interest), used to score grasp success (max lift) in trials.jsonl.
+        Fixtures and regions have no free `<name>_main` body and are skipped.
+        """
+        env = self._get_current_robosuite_env()
+        heights = {}
+        for name in env.obj_of_interest:
+            try:
+                body_id = env.sim.model.body_name2id(f"{name}_main")
+            except ValueError:
+                continue
+            heights[name] = float(env.sim.data.body_xpos[body_id][2])
+        return heights
+
     def get_object_pose(self, object_name: str) -> Optional[Pose3D]:
         """Get pose of a specific object by name."""
         objects = self.get_scene_objects()
@@ -1389,25 +1456,40 @@ class LiberoAdapter(BaseEnvAdapter):
             dtype=dtype
         )
         
-        # Extract delta positions (T, 3)
-        # For robosuite OSC, actions are typically normalized to [-1, 1]
-        # The actual scale depends on controller settings
-        # Default OSC position scale is around 0.05 m per unit action
-        ACTION_SCALE_POS = 0.01  # meters per normalized action unit
-        
-        delta_positions = action_sequence[:, :3] * ACTION_SCALE_POS
-        
-        # Cumulative sum of deltas - differentiable operation
-        cumsum_deltas = torch.cumsum(delta_positions, dim=0)  # (T, 3)
-        
-        # Build trajectory: [start_pos, start_pos + cumsum[0], start_pos + cumsum[1], ...]
-        trajectory = torch.cat([
-            start_pos.unsqueeze(0),           # (1, 3)
-            start_pos + cumsum_deltas         # (T, 3)
-        ], dim=0)  # (T+1, 3)
-        
-        return trajectory
-    
+        return predict_ee_positions(action_sequence, start_pos, self._env_config, self._last_ee_motion)
+
+    def delta_actions_to_ee_poses(
+        self,
+        action_sequence: Union[torch.Tensor, np.ndarray],
+    ) -> torch.Tensor:
+        """
+        Transform a delta action sequence into differentiable end-effector poses from the current
+        pose (see predict_ee_poses; backend.libero.ee_prediction selects the motion model).
+
+        Args:
+            action_sequence: (T, action_dim) or batched (B, T, action_dim) action sequence
+
+        Returns:
+            poses: (T+1, 4, 4) or (B, T+1, 4, 4) world-frame EE poses (including the current pose)
+        """
+        if isinstance(action_sequence, np.ndarray):
+            action_sequence = torch.from_numpy(action_sequence).float()
+        device, dtype = action_sequence.device, action_sequence.dtype
+
+        pos, ori_mat = self._measure_ee()
+        return predict_ee_poses(action_sequence, torch.as_tensor(pos, device=device, dtype=dtype),
+                                torch.as_tensor(ori_mat, device=device, dtype=dtype),
+                                self._env_config, self._last_ee_motion)
+
+    def steerable_action_dims(self) -> slice:
+        """xyz + axis-angle deltas. Keypoint rewards depend on position only, so their rotation gradient is 0."""
+        return slice(0, 6)
+
+    def _measure_ee(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Current EE position and rotation matrix (world frame) from the OSC controller: the one EE read."""
+        controller = self._get_current_robosuite_env().robots[0].controller
+        return np.array(controller.ee_pos), np.array(controller.ee_ori_mat)
+
     def unnormalize_action(self, action: np.ndarray) -> np.ndarray:
         """
         Unnormalize action from normalized to actual delta values.
@@ -1432,8 +1514,15 @@ class LiberoAdapter(BaseEnvAdapter):
         action_numpy[-1] = 1 if action_numpy[-1] > 0 else -1
 
         current_env = self._env[self.current_task_idx]
+        pos_before, rot_before = self._measure_ee()
         observation, reward, terminated, truncated, info = current_env.step(action_numpy)
         self.episode_step += 1
+
+        # Measured motion of this step: seeds the lag EE-prediction model for the next chunk
+        from scipy.spatial.transform import Rotation as R
+        pos_after, rot_after = self._measure_ee()
+        self._last_ee_motion = {'pos': pos_after - pos_before,
+                                'rot': R.from_matrix(rot_after @ rot_before.T).as_rotvec()}
 
         # Cache observation and robot state
         self._last_obs = observation
@@ -1461,6 +1550,7 @@ class LiberoAdapter(BaseEnvAdapter):
         """
         # Increment episode counter
         self.current_episode_idx += 1
+        self._last_ee_motion = {'pos': np.zeros(3), 'rot': np.zeros(3)}  # arm starts at rest
         
         # Task follows the episode index: episodes_per_task consecutive episodes per task, cycling
         task_idx = self.current_episode_idx // self.episodes_per_task % self.task_num

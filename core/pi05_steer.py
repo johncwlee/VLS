@@ -7,6 +7,7 @@ Inherits from PI05Policy and only overrides the core sampling functions
 to add steering capabilities.
 """
 
+import math
 from collections import deque
 from collections.abc import Callable
 from typing import List, Optional, Union
@@ -41,7 +42,9 @@ class PI05PolicySteer(PI05Policy):
         self._stage_init_reward = None
         self._last_normalized_reward = 0.0
         self._last_scale = 0.0
-    
+        self.last_chunk_stats = {}  # per-chunk guidance stats from the last guided sample (chunks.jsonl)
+        self._pending_noise = None  # initial noise shared by sample_unsteered and the next guided sample
+
     def post_init(
         self,
         adapter: BaseEnvAdapter,
@@ -95,6 +98,7 @@ class PI05PolicySteer(PI05Policy):
         current_stage: int = 1,
         sigmoid_k: float = 12.0,
         sigmoid_x0: float = 0.7,
+        fkd_extra_score_fn: Optional[Callable[[Tensor], Tensor]] = None,
         **kwargs  # Ignore other params for backward compatibility
     ) -> Tensor:
 
@@ -120,8 +124,10 @@ class PI05PolicySteer(PI05Policy):
                     current_stage=current_stage,
                     sigmoid_k=sigmoid_k,
                     sigmoid_x0=sigmoid_x0,
+                    fkd_extra_score_fn=fkd_extra_score_fn,
                 )
             else:
+                self._pending_noise = None  # an unsteered twin is only paired with a guided chunk
                 action_chunk = self.predict_action_chunk(batch)
             
             self._cached_action_chunk = action_chunk
@@ -129,6 +135,23 @@ class PI05PolicySteer(PI05Policy):
             action_chunk = self._cached_action_chunk
         
         return self._postprocessor(action_chunk) if self._postprocessor else action_chunk
+
+    @torch.no_grad()
+    def sample_unsteered(self, batch: dict[str, Tensor]) -> Tensor:
+        """Normalized (B, H, 7) base-policy chunk from the same Euler loop as guided sampling, all steering off.
+
+        Used as the unsteered reference for coupling and chunk logging, so steered-vs-unsteered differences
+        come only from guidance (lerobot's compiled sample_actions would also add autotuning memory).
+        """
+        self.eval()
+        batch = {k: v for k, v in batch.items() if k != ACTION}
+        bsize = batch[OBS_LANGUAGE_TOKENS].shape[0]
+        noise = self.model.sample_noise((bsize, self.model.config.chunk_size, self.model.config.max_action_dim),
+                                        batch[OBS_LANGUAGE_TOKENS].device)
+        self._pending_noise = noise
+        unsteered = self._sample_actions_guided(batch, use_diversity=False)
+        self._pending_noise = noise  # consumed by the next guided sample: unsteered[i] pairs with its particle i
+        return unsteered
 
     def _sample_actions_guided(
         self,
@@ -146,6 +169,7 @@ class PI05PolicySteer(PI05Policy):
         current_stage: int = 1,
         sigmoid_k: float = 12.0,
         sigmoid_x0: float = 0.7,
+        fkd_extra_score_fn: Optional[Callable[[Tensor], Tensor]] = None,
     ) -> Tensor:
         """
         Core guided sampling with reward-based adaptive guidance.
@@ -166,7 +190,9 @@ class PI05PolicySteer(PI05Policy):
 
         # Sample initial noise
         actions_shape = (bsize, self.model.config.chunk_size, self.model.config.max_action_dim)
-        noise = self.model.sample_noise(actions_shape, device)
+        # A preceding sample_unsteered() leaves its noise here so the guided chunk starts from the same draw
+        noise = self._pending_noise if self._pending_noise is not None else self.model.sample_noise(actions_shape, device)
+        self._pending_noise = None
 
         # Embed prefix (reuse parent's logic)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
@@ -188,7 +214,8 @@ class PI05PolicySteer(PI05Policy):
         )
 
         # Setup guidance
-        start_time = start_ratio if start_ratio is None else 0.8
+        start_time = 0.8 if start_ratio is None else float(start_ratio)
+        first_guided_step = math.ceil((1.0 - start_time) * num_steps - 1e-6)  # first step with time <= start_time (verbose log)
 
         keypoints_tensor = None
         if keypoints is not None:
@@ -197,8 +224,9 @@ class PI05PolicySteer(PI05Policy):
         use_keypoint_guidance = guidance_fn is not None and keypoints_tensor is not None
 
         # Initialize FKD if enabled
-        fkd = self._init_fkd(fkd_config, bsize, num_steps, start_time, 
-                             keypoints_tensor, guidance_fn, device) if use_fkd else None
+        fkd = self._init_fkd(fkd_config, bsize, num_steps, start_time,
+                             keypoints_tensor, guidance_fn, device, fkd_extra_score_fn) if use_fkd else None
+        self.last_chunk_stats = {'grad_norm': [], 'scale': [], 'guidance_energy': 0.0}
 
         # Flow matching loop with guidance
         dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
@@ -227,11 +255,11 @@ class PI05PolicySteer(PI05Policy):
                     v_t[:, :self._action_chunk_horizon, :3] += diversity_scale * div_grad[:, :self._action_chunk_horizon, :3]
 
             elif use_keypoint_guidance and time <= start_time:
-                kp_grad, reward_value = self._compute_keypoint_gradient(
+                kp_grad, reward_value, grad_norm = self._compute_keypoint_gradient(
                     x_t[:, :, :self._original_action_dim], 
                     keypoints_tensor, 
                     guidance_fn, 
-                    verbose=(verbose and step_idx == int(start_time * num_steps))
+                    verbose=(verbose and step_idx == first_guided_step)
                 )
                 
                 if kp_grad is not None:
@@ -261,7 +289,7 @@ class PI05PolicySteer(PI05Policy):
                     scale = guide_scale * guidance_strength 
                     self._last_scale = scale
                     
-                    if verbose and step_idx == int(start_time * num_steps):
+                    if verbose and step_idx == first_guided_step:
                         init_str = f"{self._stage_init_reward:.6f}" if self._stage_init_reward is not None else "None"
                         log.info(
                             f"[Step {global_step}] Stage {current_stage} | "
@@ -269,17 +297,30 @@ class PI05PolicySteer(PI05Policy):
                             f"norm_r={normalized_reward:.3f}, sig_strength={guidance_strength:.3f}, scale={scale:.2f}"
                         )
                     
-                    v_t[:, :self._action_chunk_horizon, :3] -= scale * kp_grad[:, :self._action_chunk_horizon, :3]
+                    # Action dims the adapter allows (LIBERO: xyz + rotation; position-only keypoint rewards
+                    # have zero rotation gradient). The gripper is never steered: the policy decides when to close.
+                    dims = self._adapter.steerable_action_dims()
+                    step_grad = kp_grad[:, :self._action_chunk_horizon, dims]
+                    v_t[:, :self._action_chunk_horizon, dims] -= scale * step_grad
+                    self.last_chunk_stats['grad_norm'].append(grad_norm)
+                    self.last_chunk_stats['scale'].append(scale)
+                    self.last_chunk_stats['guidance_energy'] += float((scale * step_grad).pow(2).sum()) * abs(float(dt))
                     
             # Euler step
             x_t = x_t + dt * v_t
 
             # FKD resampling
             if fkd is not None and time <= start_time:
-                x_t, _ = fkd.resample(sampling_idx=step_idx, latents=x_t, x0_preds=x_t)
+                x_t, _ = fkd.resample(sampling_idx=step_idx, latents=x_t, x0_preds=x_t[:, :, :self._original_action_dim])
 
             time = time + dt
             step_idx += 1
+
+        # Initial-noise index of the executed particle 0 (FKD resampling and its final sort reorder particles)
+        self.last_chunk_stats['executed_ancestor'] = int(fkd.ancestors[0]) if fkd is not None else 0
+        if fkd is not None:
+            self.last_chunk_stats['fkd_ess'] = fkd.ess_history
+            self.last_chunk_stats['fkd_resamples'] = fkd.num_resamples
 
         # Use the final reward of the first chunk as baseline for normalization
         if reward_history and self._stage_init_reward is None:
@@ -290,35 +331,48 @@ class PI05PolicySteer(PI05Policy):
         # Unpad and return
         return x_t[:, :self._action_chunk_horizon, :self._original_action_dim]
 
-    def _init_fkd(self, fkd_config, bsize, num_steps, start_time, 
-                  keypoints_tensor, guidance_fn, device):
-        """Initialize FKD for particle resampling."""
+    def _init_fkd(self, fkd_config, bsize, num_steps, start_time,
+                  keypoints_tensor, guidance_fn, device, extra_score_fn=None):
+        """Initialize FKD for particle resampling.
+
+        extra_score_fn: optional gradient-free (B, T+1, 4, 4) poses -> (B,) score added to the reward
+        (e.g. grasp discriminator confidence); it is used only for resampling weights.
+        """
         if fkd_config is None or bsize <= 1 or keypoints_tensor is None:
             return None
-        
+        fns = guidance_fn if isinstance(guidance_fn, list) else [guidance_fn]
+
         def reward_fn(x0_preds):
-            traj = self._sample_to_trajectory_3d(x0_preds)[:, 1:self._action_chunk_horizon, :3]
-            rewards = []
-            for b in range(traj.shape[0]):
-                try:
-                    if isinstance(guidance_fn, list):
-                        r = sum(fn(keypoints_tensor, traj[b:b+1]) for fn in guidance_fn)
-                    else:
-                        r = guidance_fn(keypoints_tensor, traj[b:b+1])
-                    rewards.append(float(r.item()) if hasattr(r, 'item') else float(r))
-                except Exception:
-                    rewards.append(0.0)
-            return torch.tensor(rewards, device=device, dtype=torch.float32)
-        
+            pose_fns = [fn for fn in fns if getattr(fn, 'takes_poses', False)]
+            poses = self._sample_to_ee_poses(x0_preds) if pose_fns or extra_score_fn else None
+            # Pose-based rewards score the whole batch in the keypoint rewards' units (see GraspReward.fkd_rewards)
+            rewards = sum(fn.fkd_rewards(poses) for fn in pose_fns) if pose_fns else torch.zeros(bsize, device=device)
+            point_fns = [fn for fn in fns if not getattr(fn, 'takes_poses', False)]
+            if point_fns:
+                traj = self._sample_to_trajectory_3d(x0_preds)[:, 1:self._action_chunk_horizon, :3]
+                per_particle = []
+                for b in range(traj.shape[0]):
+                    try:
+                        r = sum(fn(keypoints_tensor, traj[b:b+1]) for fn in point_fns)
+                        per_particle.append(float(r.item()) if hasattr(r, 'item') else float(r))
+                    except Exception:
+                        per_particle.append(0.0)
+                rewards = rewards + torch.tensor(per_particle, device=device, dtype=torch.float32)
+            if extra_score_fn is not None:
+                rewards = rewards + extra_score_fn(poses).to(device)
+            return rewards.float()
+
+        # FKD indexes by loop step (0..num_steps-1, the step_idx passed to resample), not by flow time:
+        # float flow times would be truncated by FKD's .long() cast and never match a step.
         return FKD(
             potential_type=fkd_config.get('potential_type', 'max'),
             lmbda=fkd_config.get('lmbda', 10.0),
             num_particles=bsize,
             adaptive_resampling=fkd_config.get('adaptive_resampling', True),
             resample_frequency=fkd_config.get('resample_frequency', 5),
-            resampling_t_start=int(start_time * num_steps),
-            resampling_t_end=num_steps,
-            timesteps=torch.linspace(1.0, 0.0, num_steps + 1, device=device),
+            resampling_t_start=math.ceil((1.0 - start_time) * num_steps - 1e-6),  # first step with time <= start_time
+            resampling_t_end=num_steps - 1,
+            timesteps=torch.arange(num_steps),
             reward_fn=reward_fn,
             reward_min_value=float('-inf'),
             device=device,
@@ -349,40 +403,53 @@ class PI05PolicySteer(PI05Policy):
         ]
         return torch.stack(trajs, dim=0).to(device, dtype)
 
+    def _sample_to_ee_poses(self, sample: Tensor) -> Tensor:
+        """Convert action sample to (B, H+1, 4, 4) EE poses (position and orientation)."""
+        if self._adapter is None or self._postprocessor is None:
+            raise RuntimeError("Call post_init() first")
+
+        device, dtype = sample.device, sample.dtype
+        actions = self._postprocessor(sample).to(device, dtype)
+        actions = self._adapter.env_postprocessor({"action": actions})["action"]
+        return self._adapter.delta_actions_to_ee_poses(actions[:, :self._action_chunk_horizon]).to(device, dtype)
+
     def _compute_keypoint_gradient(
         self,
         sample: Tensor,
         keypoints_tensor: Tensor,
         guidance_fn: Union[Callable, List[Callable]],
         verbose: bool = False,
-    ) -> tuple[Optional[Tensor], float]:
+    ) -> tuple[Optional[Tensor], float, float]:
         """
         Compute gradient for keypoint guidance with statistics for adaptive scaling.
-        
+
+        Guidance functions marked `takes_poses` (e.g. GraspReward) receive (B, H+1, 4, 4) EE poses;
+        VLM keypoint functions receive (B, H, 3) positions as before.
+
         Returns:
             normalized_grad: Normalized gradient (or None)
             reward_value: Raw reward value from guidance function
-            grad_norm: Original gradient norm (before normalization) - key for adaptive scaling
+            grad_norm: Original gradient norm (before normalization), logged per chunk
         """
         if not guidance_fn or self._adapter is None:
-            return None, 0.0
+            return None, 0.0, 0.0
 
         try:
             with torch.enable_grad():
                 sample_grad = sample.detach().requires_grad_(True)
-                traj = self._sample_to_trajectory_3d(sample_grad)[:, :self._action_chunk_horizon, :3]
-                
-                # Keep batch dimension for consistency - guidance functions expect (B, T, 3)
-                # Don't squeeze even when batch_size=1
-                traj_input = traj
-                
-                if isinstance(guidance_fn, list):
-                    reward = sum(fn(keypoints_tensor, traj_input) for fn in guidance_fn)
-                else:
-                    reward = guidance_fn(keypoints_tensor, traj_input)
-                
-                if reward is None or not reward.requires_grad:
-                    return None, 0.0
+                fns = guidance_fn if isinstance(guidance_fn, list) else [guidance_fn]
+                reward = 0.0
+                if any(getattr(fn, 'takes_poses', False) for fn in fns):
+                    poses = self._sample_to_ee_poses(sample_grad)
+                    reward = reward + sum(fn(keypoints_tensor, poses) for fn in fns if getattr(fn, 'takes_poses', False))
+                if any(not getattr(fn, 'takes_poses', False) for fn in fns):
+                    # Keep batch dimension for consistency - guidance functions expect (B, T, 3)
+                    # Don't squeeze even when batch_size=1
+                    traj_input = self._sample_to_trajectory_3d(sample_grad)[:, :self._action_chunk_horizon, :3]
+                    reward = reward + sum(fn(keypoints_tensor, traj_input) for fn in fns if not getattr(fn, 'takes_poses', False))
+
+                if reward is None or not torch.is_tensor(reward) or not reward.requires_grad:
+                    return None, 0.0, 0.0
                 
                 if reward.dim() > 0:
                     reward = reward.sum()
@@ -395,13 +462,13 @@ class PI05PolicySteer(PI05Policy):
                 
                 if verbose:
                     log.info(f"Reward: {reward_value:.4f}")
-                
-                return normalized_grad, reward_value
+
+                return normalized_grad, reward_value, grad_norm_value
         except Exception as e:
             if verbose or not hasattr(self, '_guidance_error_logged'):
                 log.warning(f"Guidance function error: {e}")
                 self._guidance_error_logged = True
-            return None, 0.0
+            return None, 0.0, 0.0
 
     def _compute_diversity_gradient(self, sample: Tensor, verbose: bool = False) -> Optional[Tensor]:
         """Compute RBF diversity gradient."""

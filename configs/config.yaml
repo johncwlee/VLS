@@ -35,8 +35,65 @@ main:
   use_vlm_stage_recognition: true  # Use Gemini to recognize current stage
   vlm_query_limit: 50  # Max VLM queries per episode
   guide_scale: 80.0  # fallback only; the LIBERO/CALVIN adapters set it per task
-  start_ratio: None
+  start_ratio: null  # when diversity hands over to reward guidance (pi0.5: flow time, 1.0 = noise; diffusion: fraction of steps); null = policy default (pi0.5: 0.8)
   # Particle, diversity and FKD params: configs/guidance/<backend>.yaml
+
+  # Steering analysis logs (pi0.5): episode_k/chunks.jsonl per guided chunk (gradient norms, FKD ESS, grasp
+  # weights/commit) and trials.jsonl max_lift per task object (grasp success, read from the sim for evaluation only)
+  analysis_logs: false
+  # With analysis_logs: also sample one unsteered twin per guided chunk (same initial noise, steering off) to
+  # measure how far steering moved the executed chunk: +1 pi0.5 sample per chunk. Coupled grasp modes always do
+  log_unsteered: false
+  # Per-step records (episode_k/steps.jsonl): executed action + measured EE pose, so
+  # scripts/calibrate_ee_model.py --from_logs can check the EE path model on real policy actions
+  log_steps: false
+  # Action -> predicted EE path model (backend.<name>.ee_prediction): null = the backend's default, except
+  # that grasp steering switches LIBERO to `lag` (it measures real centimetres); or force constant | lag
+  ee_prediction: null
+
+  # GraspGen-X grasp steering (core/grasp_guidance.py), used only in the stage the VLM flags as the grasp.
+  # enabled: false reproduces VLS exactly. Robot facts (gripper, grasp -> TCP transform) live in
+  # backend.<name>.grasp_robot. Needs the server: ./run_graspgenx_server.sh (outer repo).
+  # Distances in metres, angles in degrees.
+  grasp:
+    enabled: false              # off = VLS behaviour; the VLM's stageN_guidance runs in every stage
+    mode: one_way               # one_way: steer to GraspGen-X grasps | coupled_cheap: also reweight grasps by
+                                # how close unsteered particles get (D.1) | coupled_full: GraspGen-X sampler pulled
+                                # toward unsteered VLA poses (D.2) | nearest: AnyGrasp-style baseline (one nearest grasp)
+    endpoint: tcp://127.0.0.1:5556  # ZMQ address of scripts/graspgenx_server.py
+    score_at_close: false       # evaluation only, any arm (also with enabled=false; needs main.analysis_logs and the
+                                # server): GraspGen-X confidence of the TCP pose at each gripper close -> trials.jsonl
+    planner: graspmoe           # graspmoe: diffusion + OBB heuristic grasps | diffusion: diffusion only (coupled_full forces it)
+    num_grasps: 200             # grasps GraspGen-X samples per query
+    top_k: 64                   # grasps kept as targets after filtering, ranked by (reweighted) score. 16 often held
+                                # no grasp near the policy's approach on bottles (2026-10-28: coupled_cheap 14/20 -> 20/20)
+    robot_exclusion_radius: 0.12  # scene points this close to the TCP are the robot's own gripper; not obstacles
+    approach_max_deg: 30        # tolerance of the VLM's top_down / side approach constraint
+    keypoint_sigma: 0.03        # width of the part-keypoint reweight s_k * exp(-|g_k - kp|^2 / sigma^2)
+    pregrasp_dist: 0.08         # pre-grasp point sits this far back along the approach axis (corridor start)
+    sigma_trans: 0.015          # translation scale: this much position error costs 1
+    rot_deg_equiv: 15           # rotation error that costs the same as sigma_trans
+    gate_dist: 0.30             # orientation term switches on within about this distance of a grasp. 0.30 = from the
+                                # start of a tabletop reach; with 0.10 position converged in one chunk while rotation lagged,
+                                # and the gripper reached the object misaligned (P2 pilot, 2026-10-28)
+    gate_tau: 0.01              # sharpness of that switch (sigmoid temperature)
+    rot_tol_deg: 30             # orientation within this of a grasp costs nothing, so the reward reaches ~0 once the
+                                # gripper is close and roughly aligned and VLS eases guidance off, leaving the final
+                                # centimetres and the close to the policy as in VLS; 0 = steer to the exact grasp angle
+    beta: 0.05                  # soft-min temperature over grasps; higher = closer to a hard min. Costs are (error/sigma)^2,
+                                # so 1 cm of extra distance at 25 cm range is ~20-45 units: 0.5 was effectively a hard min
+    commit_weight: 0.8          # lock onto one grasp once it holds this share of the soft-min weight...
+    commit_dist: 0.03           # ...or once the predicted TCP ends this close to it...
+    commit_rot_deg: 30          # ...either way only if the TCP is within this orientation error of it; 180 = any
+    reacquire_dist: 0.03        # re-run GraspGen-X when the target object's keypoints move this far (e.g. a drop)
+    coupling_beta: 0.05         # D.1: temperature of sum_n exp(-beta * c_nk) over unsteered particles (same units as beta)
+    coupled_guide_scale: 10.0   # D.2: noise-space step pulling GraspGen-X samples toward unsteered VLA poses
+                                # (synthetic box: 5 barely moves them, 10 ~2 cm from target, 20 snaps on, 100 breaks grasps)
+    collision_threshold: 0.01   # gripper surface samples closer than this to a scene point make a grasp collide
+    disc_weight: 0.002          # E: weight of log discriminator confidence in FKD resampling scores (m^2 reward
+                                # units, like -dist^2); never backpropagated; 0 disables
+    disc_gate_dist: 0.10        # E acts only within about this distance of a grasp (its own key so that widening
+                                # gate_dist for orientation does not change what FKD resamples on far from the object)
 
 # ============================================================
 # Experiment Tracking

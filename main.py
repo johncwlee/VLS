@@ -127,6 +127,14 @@ class Main:
         if not 0 <= env_config['start_episode'] < env_config['episode_num']:
             raise ValueError(f"start_episode ({env_config['start_episode']}) must be in [0, episode_num={env_config['episode_num']})")
 
+        # Action -> predicted EE path model: grasp steering measures real distances, so on LIBERO it
+        # switches to the fitted lag model unless main.ee_prediction forces one; otherwise the backend default
+        grasp_enabled = bool(self.config.get('grasp', {}).get('enabled', False))
+        ee_prediction = self.config.get('ee_prediction') or ('lag' if grasp_enabled and 'ee_lag_model' in env_config else None)
+        if ee_prediction:
+            env_config['ee_prediction'] = ee_prediction
+        log.info(f"EE path prediction model: {env_config.get('ee_prediction', 'adapter default')}")
+
         # Create adapter
         self.adapter = create_adapter(self.backend, env_config)
         
@@ -247,6 +255,7 @@ class Main:
         # Ensure query_template_dir is absolute path
         if vlm_config.get('query_template_dir') and not os.path.isabs(vlm_config['query_template_dir']):
             vlm_config['query_template_dir'] = os.path.join(PROJECT_ROOT, vlm_config['query_template_dir'])
+        vlm_config['request_grasp_fields'] = bool(self.config.get('grasp', {}).get('enabled', False))
         self.vlm_agent = VLMAgent(
             config=vlm_config,
             base_dir=self.output_dir,
@@ -267,6 +276,33 @@ class Main:
 
         # Initialize video recorder
         self.video_recorder = TrajectoryVideoRecorder(output_dir=self.output_dir)
+
+        # GraspGen-X grasp steering (grasp stage only); needs ./run_graspgenx_server.sh
+        grasp_cfg = self.config.get('grasp', {})
+        if grasp_cfg and grasp_cfg.get('enabled', False):
+            from core.grasp_guidance import GraspSteering
+            robot = cfg.backend.get(self.backend, {}).get('grasp_robot')
+            if robot is None:
+                raise ValueError(f"main.grasp.enabled needs backend.{self.backend}.grasp_robot (gripper_name, grasp_to_tcp)")
+            grasp_dict = {**OmegaConf.to_container(grasp_cfg, resolve=True), **OmegaConf.to_container(robot, resolve=True)}
+            self.grasp_steering = GraspSteering(grasp_dict, self.adapter, self.policy)
+            log.info(f"Grasp steering enabled: mode={grasp_cfg.mode}, gripper={robot.gripper_name}, server={grasp_cfg.endpoint}")
+        else:
+            self.grasp_steering = None
+        # Evaluation only, in any arm (grasp steering on or off): GraspGen-X confidence of the TCP pose at each
+        # gripper close command, logged in trials.jsonl gripper_closes; needs ./run_graspgenx_server.sh
+        self.close_scorer = None
+        score_at_close = bool(grasp_cfg) and grasp_cfg.get('score_at_close', False)
+        if score_at_close and not self.config.get('analysis_logs', False):
+            log.warning("main.grasp.score_at_close needs main.analysis_logs=true; gripper closes are not scored")
+        elif score_at_close:
+            from core.grasp_guidance import GraspGenXClient
+            robot = cfg.backend.get(self.backend, {}).get('grasp_robot')
+            if robot is None:
+                raise ValueError(f"main.grasp.score_at_close needs backend.{self.backend}.grasp_robot")
+            client = GraspGenXClient(grasp_cfg['endpoint'])
+            client.request({'action': 'health'})  # fail fast if the server is not running
+            self.close_scorer = (client, OmegaConf.to_container(robot, resolve=True))
 
         self.cached_functions_dir = self.config.get('cached_functions_dir', None)
 
@@ -353,6 +389,8 @@ class Main:
             segment_id_to_name=segment_id_to_name
         )
         
+        self.segment_id_to_name = segment_id_to_name  # keypoint mask id -> object name (grasp steering)
+
         # Save for stage recognition (used by Gemini)
         self.init_img_with_keypoints = projected_img  # Initial image with keypoint annotations
         self.keypoint_id_to_object = key_points_objects_map  # Keypoint ID -> object name mapping
@@ -389,6 +427,14 @@ class Main:
         output_raw_path = os.path.join(guidance_functions_dir, 'output_raw.txt')
         self.stage_descriptions = self.vlm_agent._extract_stage_descriptions_from_output(output_raw_path)
         
+        if self.grasp_steering is not None:
+            grasp_info = self.program_info.get('grasp')
+            self.grasp_steering.reset_episode(grasp_info)
+            if not grasp_info or grasp_info.get('grasp_stage') is None:
+                log.warning("Grasp steering is on but the VLM gave no grasp stage/object "
+                            "(or cached functions predate it); this episode runs as plain VLS")
+            log.info(f"Grasp target from VLM: {grasp_info}")
+
         for stage, fns in self.guidance_fns.items():
             log.info(f"Stage {stage}: {len(fns)} guidance functions loaded")
         log.info(f"Loaded {len(self.guidance_fns)} stages total")
@@ -534,9 +580,14 @@ class Main:
 
             # Wrap entire episode execution in try-except
             successes_before = self.success_count
+            self.episode_max_lift = {}
             try:
                 self._run_episode(episode, episode_dir)
                 trial['outcome'] = 'success' if self.success_count > successes_before else 'fail'
+                if self.config.get('analysis_logs', False):
+                    trial['gripper_closes'] = self.episode_closes  # state at each close command (evaluation only)
+                if self.grasp_steering is not None:  # 0 = the episode ran as plain VLS (no usable grasp target)
+                    trial['grasp_engaged_chunks'] = self.grasp_steering.engaged_chunks
             except Exception as e:
                 trial['outcome'], trial['error'] = 'execution_error', str(e)
                 log.error(f"Episode {episode+1} execution failed: {e}")
@@ -550,6 +601,9 @@ class Main:
                     f.write(f"Episode failed due to execution error: {e}\n")
                 log.warning(f"Skipping episode {episode+1} due to execution error")
                 os.rename(episode_dir, f'{episode_dir}_failed')
+            # Also for execution errors, so grasp success has the same denominator as task success
+            if self.episode_max_lift:
+                trial['max_lift'] = self.episode_max_lift  # m per object of interest (evaluation only)
             self._record_trial(trials, trial, vlm_clients)
 
         # Final statistics
@@ -580,6 +634,74 @@ class Main:
         with open(os.path.join(self.output_dir, 'trials.jsonl'), 'a') as f:
             f.write(json.dumps(trial) + "\n")
 
+    def _log_chunk(self, episode_dir: str, global_step: int, stage: int, grasp_active: bool, unsteered,
+                   executed_poses=None):
+        """Append one guided chunk's record to chunks.jsonl (for steering analysis and residual-policy data).
+
+        With main.log_unsteered, also records how far steering moved the executed particle from its own
+        unsteered twin (same initial noise; FKD ancestry gives the index): L2 in normalized action space and
+        chunk-end TCP distance. Nearest/mean over all unsteered samples are kept as a noise-floor reference.
+        """
+        executed = self.policy._cached_action_chunk[:1]  # normalized (1, H, 7); particle 0 is executed
+        record = {'step': global_step, 'stage': stage, **self.policy.last_chunk_stats}
+        if grasp_active:
+            record['grasp'] = self.grasp_steering.record
+        if unsteered is not None:
+            with torch.no_grad():
+                unsteered = unsteered.to(executed.device, executed.dtype)
+                dists = torch.linalg.vector_norm((unsteered - executed).flatten(1), dim=1)
+                if executed_poses is None:
+                    executed_poses = self.policy._sample_to_ee_poses(executed)
+                tcp_dists = torch.linalg.vector_norm(
+                    self.policy._sample_to_ee_poses(unsteered)[:, -1, :3, 3] - executed_poses[:, -1, :3, 3], dim=-1)
+            twin = record.get('executed_ancestor', 0)
+            record.update({'twin_l2': float(dists[twin]), 'twin_tcp_dist': float(tcp_dists[twin]),
+                           'unsteered_l2_min': float(dists.min()), 'unsteered_l2_mean': float(dists.mean()),
+                           'unsteered_tcp_dist_min': float(tcp_dists.min())})
+        with open(os.path.join(episode_dir, 'chunks.jsonl'), 'a') as f:
+            f.write(json.dumps(record) + "\n")
+
+    def _gripper_close_record(self, step: int, stage: int, use_guidance: bool, ee_pos: np.ndarray,
+                              prev_ee_pos: Optional[np.ndarray], objects: list) -> dict:
+        """Evaluation only: how the gripper closed (trials.jsonl gripper_closes). speed_cm is the TCP motion of the
+        previous step; guide_scale/norm_reward the VLS guidance state; nearest_grasp_* the nearest GraspGen-X target
+        in grasp arms; quality the GraspGen-X discriminator's confidence of this TCP pose as a grasp on each
+        object of interest (main.grasp.score_at_close)."""
+        record = {'step': step, 'stage': stage,
+                  'speed_cm': None if prev_ee_pos is None else 100 * float(np.linalg.norm(ee_pos - prev_ee_pos))}
+        if use_guidance and hasattr(self.policy, 'get_last_scale'):
+            record['guide_scale'] = float(self.policy.get_last_scale())
+            record['norm_reward'] = float(self.policy.get_normalized_reward())
+        if self.grasp_steering is not None and self.grasp_steering.reward is not None:
+            from utils.grasp_costs import orientation_cost, orientation_cost_to_deg
+            targets = self.grasp_steering.reward.targets
+            tcp = torch.as_tensor(self.adapter.get_ee_pose_world().to_transformation_matrix(), dtype=targets.dtype)
+            k = int(torch.norm(targets[:, :3, 3] - tcp[:3, 3], dim=1).argmin())
+            rot_cost = orientation_cost(tcp[:3, :3], targets[k:k + 1, :3, :3])[0]
+            record['nearest_grasp_dist_cm'] = 100 * float(torch.norm(targets[k, :3, 3] - tcp[:3, 3]))
+            record['nearest_grasp_rot_deg'] = float(orientation_cost_to_deg(rot_cost))
+        if self.close_scorer is not None:
+            from core.grasp_guidance import score_tcp_pose
+            try:
+                record['quality'] = score_tcp_pose(*self.close_scorer, self.adapter, objects)
+            except Exception as e:  # evaluation-only logging must not end the episode
+                log.warning(f"Grasp quality scoring failed: {e}")
+                record['quality_error'] = str(e)
+        return record
+
+    def _log_step(self, episode_dir: str, global_step: int, chunk_index: int, action, ee_before):
+        """Append the executed action and measured EE pose before/after to steps.jsonl
+        (scripts/calibrate_ee_model.py --from_logs fits and scores EE models on these real policy actions)."""
+        ee_after = self.adapter.get_ee_pose_world()
+        record = {
+            'step': global_step, 'chunk_index': chunk_index,
+            'action': [float(x) for x in (action.tolist() if hasattr(action, 'tolist') else action)],
+            'ee_pos_before': ee_before.position.tolist(), 'ee_quat_wxyz_before': ee_before.quaternion.tolist(),
+            'ee_pos_after': ee_after.position.tolist(), 'ee_quat_wxyz_after': ee_after.quaternion.tolist(),
+        }
+        with open(os.path.join(episode_dir, 'steps.jsonl'), 'a') as f:
+            f.write(json.dumps(record) + "\n")
+
     def _run_episode(self, episode: int, episode_dir: str):
         """Run a single episode with the current configuration."""
         observation = self._get_policy_observation()
@@ -602,6 +724,12 @@ class Main:
         action_chunk = None
         
         log.info(f"Task description: {self.adapter.get_task_description()}")
+
+        # Evaluation only: max lift of the task's objects of interest (grasp success in trials.jsonl)
+        object_heights = getattr(self.adapter, 'get_objects_of_interest_heights', None) if self.config.get('analysis_logs', False) else None
+        start_heights = object_heights() if object_heights else {}
+        self.episode_max_lift = {name: 0.0 for name in start_heights}
+        self.episode_closes, prev_ee_pos, prev_grip = [], None, -1.0
         
         # Default: start with stage 1 and guidance ON
         current_stage = 1
@@ -626,6 +754,8 @@ class Main:
         
         while not done:
             generate_new_chunk = (action_executed == 0)
+            if generate_new_chunk:
+                fkd_extra_score_fn, unsteered = None, None
 
             if generate_new_chunk and self.config.get("use_guidance", True) and hasattr(self, 'guidance_fns'):
                 keypoints = self.keypoint_tracker.get_keypoint_positions()
@@ -638,6 +768,22 @@ class Main:
                 current_stage = stage_state['current_stage']
                 use_guidance = stage_state['use_guidance']
                 current_guidance_fns = self.guidance_fns.get(current_stage, []) if use_guidance else None
+
+                if use_guidance:
+                    grasp_stage = self.grasp_steering is not None and self.grasp_steering.is_grasp_stage(current_stage)
+                    log_twin = self.config.get('log_unsteered', False) and self.config.get('analysis_logs', False)
+                    coupling = (grasp_stage and self.grasp_steering.cfg['mode'].startswith('coupled')
+                                and (self.grasp_steering.reward is None or self.grasp_steering.reward.committed is None))
+                    if hasattr(self.policy, 'sample_unsteered') and (log_twin or coupling):
+                        unsteered = self.policy.sample_unsteered(observation)
+                    if grasp_stage:
+                        keypoint_names = [self.segment_id_to_name.get(m) for m in mask_ids]
+                        grasp_fns = self.grasp_steering.guidance_fns(keypoints, keypoint_names, unsteered)
+                        if grasp_fns:
+                            current_guidance_fns = grasp_fns
+                            # E: discriminator-scored resampling; the nearest-grasp baseline stays detector-only
+                            if self.grasp_steering.cfg['mode'] != 'nearest' and self.grasp_steering.cfg['disc_weight'] > 0:
+                                fkd_extra_score_fn = self.grasp_steering.fkd_extra_score
                 
                 if use_guidance and not current_guidance_fns:
                     log.warning(f"No guidance functions for stage {current_stage}, disabling")
@@ -671,7 +817,16 @@ class Main:
                 fkd_config=OmegaConf.to_container(self.config.get("fkd", {}), resolve=True) if self.config.get("fkd") else None,
                 global_step=global_steps,
                 current_stage=current_stage,
+                fkd_extra_score_fn=fkd_extra_score_fn,
             )
+
+            if generate_new_chunk and use_guidance:
+                grasp_active = any(getattr(fn, 'takes_poses', False) for fn in current_guidance_fns or [])
+                executed_poses = None
+                if grasp_active:  # commit check on the executed particle (particle 0)
+                    executed_poses = self.grasp_steering.after_chunk(self.policy._cached_action_chunk[:1], global_steps)
+                if self.config.get('analysis_logs', False) and hasattr(self.policy, 'last_chunk_stats'):  # pi0.5 only
+                    self._log_chunk(episode_dir, global_steps, current_stage, grasp_active, unsteered, executed_poses)
 
             if hasattr(self.adapter, 'env_postprocessor'):
                 action_transition = {"action": action_chunk}
@@ -691,6 +846,14 @@ class Main:
             else:
                 image = np.array(self.adapter.get_vlm_image())
             
+            # Grasp targets in the grasp stage (video only)
+            if self.grasp_steering is not None and self.grasp_steering.reward is not None \
+                    and self.grasp_steering.is_grasp_stage(current_stage):
+                from utils.vis_utils import draw_grasps_on_vlm_image
+                image = draw_grasps_on_vlm_image(self.adapter, image, self.grasp_steering.reward.targets.numpy(),
+                                                 self.grasp_steering.reward.committed,
+                                                 self.grasp_steering.cfg['pregrasp_dist'])
+
             # Draw keypoints on image for debugging (disabled by default)
             if self.config.get("debug_draw_keypoints", False) and keypoints is not None:
                 from utils.vis_utils import draw_keypoints_on_image
@@ -730,7 +893,22 @@ class Main:
             
             image_with_status = add_text_to_image(image, status_text)
             self.video_recorder.add_frame(self.adapter.vlm_camera, image_with_status)
-            obs, reward, terminated, truncated, info = self.adapter.step(action_chunk[0][action_executed])
+            executed_action = action_chunk[0][action_executed]
+            if self.config.get('analysis_logs', False) or self.config.get('log_steps', False):
+                ee_before = self.adapter.get_ee_pose_world()
+            if self.config.get('analysis_logs', False):
+                ee_pos, grip = ee_before.position, float(executed_action[-1])
+                if grip > 0 >= prev_grip:  # close command (gripper action: -1 open, +1 close)
+                    self.episode_closes.append(self._gripper_close_record(
+                        global_steps, current_stage, use_guidance, ee_pos, prev_ee_pos, list(start_heights)))
+                prev_ee_pos, prev_grip = ee_pos, grip
+            obs, reward, terminated, truncated, info = self.adapter.step(executed_action)
+            if self.config.get('log_steps', False):
+                self._log_step(episode_dir, global_steps, action_executed, executed_action, ee_before)
+
+            if start_heights:
+                for name, z in object_heights().items():
+                    self.episode_max_lift[name] = max(self.episode_max_lift[name], z - start_heights[name])
 
             action_executed += 1
             if action_executed == action_horizon:

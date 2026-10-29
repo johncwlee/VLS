@@ -29,3 +29,27 @@ libero:
   task_ids_filter:  null #[2, 6, 8] #[0, 2, 3, 4, 8] #= all tasks, or list like [0, 1, 2], we do not need this
   
  
+  # OSC delta action -> predicted EE path (core/env_adapters/libero_adapter.py, _ee_step_motion).
+  # Fit and check with scripts/calibrate_ee_model.py; main.ee_prediction can override the model choice.
+  ee_prediction: constant     # constant: fixed scale per unit (VLS's original) | lag: fitted OSC response below
+  action_scale_pos: 0.01      # constant model: metres per normalized action unit (robosuite's nominal is 0.05,
+                              # but the arm lags; random-action fit ~0.013)
+  action_scale_rot: 0.1       # constant model: radians per normalized action unit (fit ~0.1; nominal 0.5)
+  ee_lag_model:               # lag model, per world axis: motion_t = gain * action_t + lag * motion_(t-1)
+                              # (pooled fit over libero_object/spatial/goal/10, 300 random steps each, 2026-10-27).
+                              # On 6 held-out real pi0.5 rollouts: chunk-end 1.08 cm median / 3.5 cm p90 vs 2.37 / 3.0 cm
+                              # for `constant`. A refit on those rollouts did no better (1.07 / 2.9 cm) and lost to
+                              # `constant` on random actions, so this broader fit is kept.
+    pos_gain: [0.00521, 0.00623, 0.00582]  # metres per normalized action unit
+    pos_lag: [0.6215, 0.57006, 0.58093]    # share of the previous step's motion carried over
+    rot_gain: [0.04673, 0.04018, 0.04987]  # radians per normalized action unit
+    rot_lag: [0.6021, 0.5899, 0.54252]
+
+  # Robot facts for GraspGen-X grasp steering (main.grasp)
+  grasp_robot:
+    gripper_name: franka_panda  # GraspGen-X gripper description of this robot's gripper
+    grasp_to_tcp:               # GraspGen-X grasp frame (+Z approach, +X closing, gripper base) -> the adapter's TCP.
+                                # robosuite's Panda eef frame already closes along X; grip_site is 0.097 m along +Z
+                                # (robosuite models/assets/grippers/panda_gripper.xml)
+      translation: [0.0, 0.0, 0.097]
+      quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]

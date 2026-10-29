@@ -123,6 +123,10 @@ class FKD:
         # Incremental check
         self._last_idx_sampled = -1
         self._reached_terminal_sample = False
+        # Diagnostics for per-chunk logging
+        self.ess_history: List[float] = []
+        self.num_resamples = 0
+        self.ancestors = torch.arange(self.num_particles)  # initial-noise index of each current particle
 
         # Process discrete time steps of the scheduler (e.g., [999, ..., 0])
         if isinstance(timesteps, torch.Tensor):
@@ -244,17 +248,19 @@ class FKD:
         rs_candidates, population_samples = self._compute_reward(x0)
 
         # Calculate potential & weights
+        # Weights are built in log space and shifted by their max before exp: resampling only uses
+        # relative weights, and large-magnitude rewards would otherwise underflow every weight to 0.
         if self.potential_type == PotentialType.MAX:
             rs_candidates = torch.max(rs_candidates, self.population_rs)
-            w = torch.exp(self.lmbda * rs_candidates)
+            log_w = self.lmbda * rs_candidates
         elif self.potential_type == PotentialType.ADD:
             rs_candidates = rs_candidates + self.population_rs
-            w = torch.exp(self.lmbda * rs_candidates)
+            log_w = self.lmbda * rs_candidates
         elif self.potential_type == PotentialType.DIFF:
             diffs = rs_candidates - self.population_rs
-            w = torch.exp(self.lmbda * diffs)
+            log_w = self.lmbda * diffs
         elif self.potential_type == PotentialType.RT:
-            w = torch.exp(self.lmbda * rs_candidates)
+            log_w = self.lmbda * rs_candidates
         else:
             raise ValueError(f"Unknown potential type: {self.potential_type}")
 
@@ -264,7 +270,8 @@ class FKD:
             PotentialType.ADD,
             PotentialType.RT,
         ):
-            w = torch.exp(self.lmbda * rs_candidates) / self.product_of_potentials
+            log_w = self.lmbda * rs_candidates - torch.log(self.product_of_potentials)
+        w = torch.exp(log_w - log_w[torch.isfinite(log_w)].max()) if torch.isfinite(log_w).any() else torch.ones_like(log_w)
 
         # Numerical stability: clip and handle NaN
         w = torch.clamp(w, 0, 1e10)
@@ -280,15 +287,18 @@ class FKD:
         if self.adaptive_resampling or at_terminal_sample:
             normalized_w = w / w.sum()
             ess = 1.0 / (normalized_w.pow(2).sum() + 1e-12)
+            self.ess_history.append(float(ess))
             if ess >= 0.5 * self.num_particles and not at_terminal_sample:
                 # Effective sample size is sufficient, no forced resampling
                 do_resample = False
 
         if do_resample:
+            self.num_resamples += 1
             indices = torch.multinomial(
                 w, num_samples=self.num_particles, replacement=True
             )
             resampled_xt = _list_tensor_index(xt, indices)
+            self.ancestors = self.ancestors[indices.cpu()]
             self.population_rs = rs_candidates[indices]
             resampled_x0 = _list_tensor_index(population_samples, indices)
             # Update accumulated potential (only accumulated on the resampling path)
@@ -305,6 +315,7 @@ class FKD:
         # ensure index 0 corresponds to the sample with the highest reward, for downstream direct sample[0].
         if at_terminal_sample:
             sort_indices = torch.argsort(self.population_rs, descending=True)
+            self.ancestors = self.ancestors[sort_indices.cpu()]
             resampled_xt = _list_tensor_index(resampled_xt, sort_indices)
             resampled_x0 = _list_tensor_index(resampled_x0, sort_indices)
             self.population_rs = self.population_rs[sort_indices]

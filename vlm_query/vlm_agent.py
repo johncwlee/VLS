@@ -91,6 +91,12 @@ class VLMAgent:
         # Insert environment notes into the base template's placeholder
         # We use replace instead of format to avoid issues with code-style braces in the template
         self.prompt_template = base_template.replace("{task_specific_patterns}", env_notes)
+        # GraspGen-X grasp steering asks the VLM for the grasp stage/object; without it the prompt is unchanged
+        grasp_fields = ""
+        if self.config.get("request_grasp_fields", False):
+            with open(os.path.join(template_dir, 'grasp_fields_template.txt'), 'r') as f:
+                grasp_fields = f.read()
+        self.prompt_template = self.prompt_template.replace("{grasp_fields}", grasp_fields)
         log.info(f"Initialized combined prompt template using {env_template_file} as task-specific notes")
 
         with open(os.path.join(template_dir, 'stage_template.txt'), 'r') as f:
@@ -226,7 +232,33 @@ class VLMAgent:
             data_dict['stage_names'] = [f"Stage {i+1}" for i in range(data_dict['num_stages'])]
             log.info(f"stage_names not found in output, using default")
 
+        if self.config.get("request_grasp_fields", False):
+            data_dict['grasp'] = self._parse_grasp_fields(output)
         return data_dict
+
+    @staticmethod
+    def _parse_grasp_fields(output):
+        """Parse the optional `grasp_* = value` lines used by GraspGen-X grasp steering (None when absent)."""
+        import re
+        grasp = {'grasp_stage': None, 'grasp_object': None, 'grasp_keypoint': None, 'grasp_approach': None}
+        for line in output.split("\n"):
+            # Top-level lines only: indented assignments are locals inside the VLM's stage functions
+            match = re.match(r"(grasp_stage|grasp_object|grasp_keypoint|grasp_approach)\s*=\s*(.*)", line)
+            if match is None:
+                continue
+            value = match.group(2).split('#')[0].strip().strip('"\'')
+            if value in ('', 'None', '?'):
+                continue
+            if match.group(1) in ('grasp_stage', 'grasp_keypoint'):
+                if not value.isdigit():
+                    log.warning(f"Non-integer {match.group(1)} {value!r}; ignoring it")
+                    continue
+                value = int(value)
+            grasp[match.group(1)] = value
+        if grasp['grasp_approach'] not in (None, 'top_down', 'side'):
+            log.warning(f"Unknown grasp_approach {grasp['grasp_approach']!r}; ignoring it")
+            grasp['grasp_approach'] = None
+        return grasp
 
     def _save_metadata(self, metadata):
         for k, v in metadata.items():

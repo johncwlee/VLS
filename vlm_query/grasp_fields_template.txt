@@ -1,0 +1,6 @@
+
+# Grasp target (still write a guidance function for every stage, including the grasp stage):
+grasp_stage = ?        # number of the stage that ends with the gripper closing on an object, or None if no stage grasps
+grasp_object = "?"     # object name (from the keypoint-object map) grasped in that stage, or None
+grasp_keypoint = None  # index of the keypoint on the part that must be grasped (e.g. a handle), or None for anywhere on the object
+grasp_approach = None  # "top_down" or "side" if the task requires that approach direction, else None

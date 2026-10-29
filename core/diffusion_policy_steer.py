@@ -131,6 +131,7 @@ class DiffusionPolicySteer(DiffusionPolicy):
         fkd_config: Optional[dict] = None,
         global_step: int = 0,
         current_stage: int = 1,
+        **kwargs  # pi0.5-only params from main.py (e.g. fkd_extra_score_fn)
     ) -> Tensor:
 
         if batch is None:

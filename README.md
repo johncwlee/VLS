@@ -158,6 +158,21 @@ keypoint_detector:
   bounds_max: [0.10, 0.75, 1.2]
 ```
 
+### GraspGen-X Grasp Steering (LIBERO, optional)
+
+In the stage the VLM flags as the grasp (`grasp_stage` / `grasp_object` in its reply), the keypoint reward is
+replaced by a 6-DOF grasp reward over [GraspGen-X](https://github.com/NVlabs/GraspGenX) grasps
+(`core/grasp_guidance.py`). GraspGen-X runs as a separate ZMQ server in its own environment
+(`scripts/graspgenx_server.py`; outer repo: `./run_graspgenx_server.sh`). Enable it with
+`main.grasp.enabled=true` and pick `main.grasp.mode` (`one_way`, `coupled_cheap`, `coupled_full`, `nearest`).
+With `enabled: false` (the default) VLS behaves as before, prompt included; the analysis logs
+(`main.analysis_logs`, `log_unsteered`, `log_steps`) are also off by default (`tests/test_vls_unchanged.py`). Shared keys are documented under
+`main.grasp` in `configs/config.yaml`; robot facts (gripper, grasp-to-TCP transform) and the action-to-EE-path
+model (`ee_prediction`, calibrated by `scripts/calibrate_ee_model.py`) live in `configs/backend/libero.yaml`.
+A new robot needs `delta_actions_to_ee_poses` and `steerable_action_dims` in its adapter plus a `grasp_robot`
+block. Experiments: `./run_grasp_experiments.sh` (outer repo), summarized by `scripts/summarize_grasp_experiments.py`.
+Tests: `python -m pytest tests -q` (server tests are skipped when it is not running).
+
 ## Running the Pipeline
 
 ### Basic Usage
@@ -273,6 +288,9 @@ results/
     │   │   ├── output_raw.txt          # VLM response
     │   │   └── stage1_guidance.txt     # Parsed guidance
     │   ├── trajectory_*.png            # Trajectory visualization per step
+    │   ├── chunks.jsonl                # With main.analysis_logs: per guided chunk gradient norms, FKD ESS,
+    │   │                               #   grasp weights/commit, distance to the unsteered twin
+    │   ├── steps.jsonl                 # With main.log_steps: executed action + measured EE pose per step
     │   ├── episode_1_success.mp4       # Execution video
     │   └── keypoints_tracking.mp4      # Keypoint tracking video
     ├── episode_2/

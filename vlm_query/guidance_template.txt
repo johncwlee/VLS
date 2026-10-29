@@ -81,7 +81,7 @@ The guidance function returns a REWARD. Higher reward = better. The diffusion mo
 # ... (continue for all stages)
 
 num_stages = ?
-
+{grasp_fields}
 ### stage 1 guidance (if guidance is needed for this stage)
 def stage1_guidance(keypoints, action_sequence):
     # ALL code must be inside this function - no external helpers!

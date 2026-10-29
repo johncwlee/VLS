@@ -235,7 +235,26 @@ class BaseEnvAdapter(gym.Env):
             trajectory_3d: (T+1, 3) 3D position trajectory (including start point)
         """
         pass
-    
+
+    # Grasp steering (core/grasp_guidance.py) needs the two methods below. Each robot implements them in
+    # its own action space: delta-EE integration (LIBERO), FK of joint targets (e.g. Trossen), ...
+    def delta_actions_to_ee_poses(
+        self,
+        action_sequence: Union[np.ndarray, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Differentiable (T+1, 4, 4) world-frame TCP poses predicted for a (T, action_dim) action sequence
+        (index 0 = now); a batched (B, T, action_dim) input gives (B, T+1, 4, 4).
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not predict EE poses; grasp steering needs it")
+
+    def steerable_action_dims(self) -> slice:
+        """
+        Action dimensions that guidance gradients may change. Default: the xyz translation of a
+        delta-EE action. Grippers are never included: the policy decides when to close.
+        """
+        return slice(0, 3)
+
     @abstractmethod
     def get_action_space_info(self) -> Dict[str, Any]:
         """

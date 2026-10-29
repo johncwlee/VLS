@@ -455,6 +455,37 @@ def draw_action_trajectory_on_vlm_image(
     return image_draw
 
 
+def draw_grasps_on_vlm_image(
+    adapter: BaseEnvAdapter,
+    image: np.ndarray,
+    tcp_poses: np.ndarray,
+    committed: Optional[int] = None,
+    pregrasp_dist: float = 0.08,
+    jaw_half_width: float = 0.04,
+) -> np.ndarray:
+    """
+    Draw grasp targets on the final (already flipped) LIBERO VLM image.
+
+    Each grasp is a line from its pre-grasp point to the TCP target (approach) plus a bar along the jaw
+    closing axis; the committed grasp is drawn thicker in red.
+    """
+    camera_params = adapter.get_camera_params(adapter.vlm_camera)
+    image = np.ascontiguousarray(image).copy()
+    H, W = image.shape[:2]
+    for k, T in enumerate(np.asarray(tcp_poses)):
+        p, approach, closing = T[:3, 3], T[:3, 2], T[:3, 0]
+        pts = np.stack([p - pregrasp_dist * approach, p, p - jaw_half_width * closing, p + jaw_half_width * closing])
+        uv, valid = project_3d_to_2d(pts, camera_params.intrinsic, camera_params.extrinsic)
+        if not valid.all():
+            continue
+        uv[:, 1] = H - 1 - uv[:, 1]  # LIBERO VLM images are flipped vertically after rendering
+        uv = uv.astype(np.int32)
+        color, width = ((255, 0, 0), 3) if k == committed else ((0, 220, 255), 1)
+        cv2.line(image, tuple(uv[0]), tuple(uv[1]), color, width, cv2.LINE_AA)
+        cv2.line(image, tuple(uv[2]), tuple(uv[3]), color, width, cv2.LINE_AA)
+    return image
+
+
 def draw_keypoints_on_image(
     adapter: BaseEnvAdapter,
     image: np.ndarray,
