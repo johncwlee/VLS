@@ -131,7 +131,7 @@ def _validate_guidance_functions(functions, source_path="unknown"):
     # keypoints: (N, 3), trajectory: (B, T, 3)
     # Use 30 keypoints to cover typical LIBERO scenes (usually 15-25 keypoints)
     dummy_keypoints = torch.randn(30, 3)  # 30 keypoints to handle most scenes
-    dummy_trajectory = torch.randn(1, 10, 3)  # batch=1, 10 timesteps, 3D positions
+    dummy_trajectory = torch.randn(1, 10, 3, requires_grad=True)  # batch=1, 10 timesteps, 3D positions
     
     for i, func in enumerate(functions):
         try:
@@ -148,7 +148,11 @@ def _validate_guidance_functions(functions, source_path="unknown"):
             if not result.requires_grad:
                 # This is a warning, not an error - some functions may not need grad
                 print(f"Warning: Function {i} from {source_path} returned tensor without grad")
-                
+            else:
+                grad = torch.autograd.grad(result.sum(), dummy_trajectory, allow_unused=True)[0]
+                if grad is None or grad.norm() < 1e-8:
+                    print(f"Warning: Function {i} from {source_path} has zero gradient (no steering)")
+
         except Exception as e:
             raise ValueError(
                 f"Guidance function validation failed for {source_path} (function {i}): {e}\n"
