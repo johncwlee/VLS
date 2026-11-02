@@ -62,7 +62,9 @@ class VLMAgent:
         
         # Load prompt templates with base + environment-specific logic
         template_dir = self.config["query_template_dir"]
-        base_template_path = os.path.join(template_dir, 'guidance_template.txt')
+        # free_form_reward: same interface, but the reward's shape is left to the VLM (prompt-only ablation)
+        base_template_file = 'guidance_template_free_reward.txt' if self.config.get('free_form_reward', False) else 'guidance_template.txt'
+        base_template_path = os.path.join(template_dir, base_template_file)
         
         # Determine environment-specific template
         if self.env_type:

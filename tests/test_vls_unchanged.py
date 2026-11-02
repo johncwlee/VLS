@@ -99,3 +99,29 @@ def test_new_features_default_off():
     assert main['ee_prediction'] is None and libero['ee_prediction'] == 'constant'
     assert libero['action_scale_pos'] == 0.01  # VLS's original EE scale
     assert not any(main[k] for k in ('analysis_logs', 'log_unsteered', 'log_steps'))
+    vlm_agent = yaml.safe_load((VLS_ROOT / "configs" / "perception.yaml").read_text())['vlm_agent']
+    assert vlm_agent['free_form_reward'] is False
+
+
+def make_agent(**config):
+    from vlm_query.vlm_agent import VLMAgent
+    return VLMAgent({'provider': 'claude_code', 'model': 'x',
+                     'query_template_dir': str(VLS_ROOT / "vlm_query"), **config}, env_type='libero')
+
+
+def test_free_form_reward_off_keeps_original_prompt():
+    original = (VLS_ROOT / "vlm_query" / "guidance_template.txt").read_text()
+    assert make_agent(free_form_reward=False).prompt_template.startswith(original.split("{grasp_fields}")[0])
+    assert make_agent().prompt_template == make_agent(free_form_reward=False).prompt_template
+
+
+def test_free_form_prompt_keeps_interface():
+    """The free-form prompt drops the reward-shape recipe but keeps everything main.py parses."""
+    prompt = make_agent(free_form_reward=True).prompt_template
+    libero_notes = (VLS_ROOT / "vlm_query" / "guidance_template_libero.txt").read_text()
+    for kept in ("def stage1_guidance(keypoints, action_sequence):", "num_stages = ?", "# Task breakdown:",
+                 "# Stage 1:", "    return reward.mean()", "{instruction}", "{key_points_objects_map}",
+                 "{init_keypoint_positions}", libero_notes):
+        assert kept in prompt, kept
+    for dropped in ("-(distance**2)", "int(0.7 * T)", "offsetted_point", "{grasp_fields}", "{task_specific_patterns}"):
+        assert dropped not in prompt, dropped
