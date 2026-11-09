@@ -11,6 +11,7 @@ import logging
 import netrc
 import os
 import time
+import uuid
 from collections import defaultdict
 from pathlib import Path
 
@@ -58,7 +59,7 @@ class Monitor:
                              "WANDB_API_KEY in .env), or pass logging.wandb.mode=offline to log locally.")
         import wandb
         id_file = run_dir / "wandb_id.txt"
-        run_id = id_file.read_text().strip() if id_file.exists() else wandb.util.generate_id()
+        run_id = id_file.read_text().strip() if id_file.exists() else uuid.uuid4().hex[:8]
         id_file.write_text(run_id)
         self.wandb = wandb.init(project=wcfg.project, entity=wcfg.entity, group=wcfg.group, tags=list(wcfg.tags),
                                 mode=wcfg.mode, dir=str(run_dir), id=run_id, resume="allow", name=run_dir.name,
