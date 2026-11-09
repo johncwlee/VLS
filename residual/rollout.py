@@ -4,7 +4,7 @@ adapter, success/termination from the env (spec §7.1 labels: `label_source = "s
 """
 
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,6 +28,35 @@ def make_adapter(env_overrides: dict, task_id: int):
     cfg.update(env_overrides)
     cfg.update(task_ids_filter=[task_id], episode_num=1, start_episode=0)
     return create_adapter("libero", cfg)
+
+
+def task_specs(env_cfg) -> list[tuple[str, int]]:
+    """(suite, task id) for every task of a run. One run covers one perturbation type across base suites:
+    suite = f"{base}_{env.perturbation}"; tasks are env.task_ids_by_suite[base] if given, else env.task_ids."""
+    specs = []
+    for base in env_cfg.suites:
+        ids = env_cfg.task_ids_by_suite.get(base) or env_cfg.task_ids
+        specs += [(f"{base}_{env_cfg.perturbation}", int(t)) for t in ids]
+    return specs
+
+
+class EnvPool:
+    """Least-recently-used cache of LIBERO adapters: each holds ~0.5-1.5 GB RAM, and rebuilding one takes 1-2 s."""
+
+    def __init__(self, max_open: int):
+        self.max_open, self.open = max_open, OrderedDict()
+
+    def get(self, suite: str, task_id: int):
+        key = (suite, task_id)
+        if key in self.open:
+            self.open.move_to_end(key)
+            return self.open[key]
+        while len(self.open) >= self.max_open:
+            _, old = self.open.popitem(last=False)
+            for env in old._env:
+                env.close()
+        self.open[key] = make_adapter({"suite_name": suite}, task_id)
+        return self.open[key]
 
 
 def snapshot(obs: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

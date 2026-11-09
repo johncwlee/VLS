@@ -15,9 +15,11 @@ import numpy as np
 
 
 def chunk_reward(steered: np.ndarray, terminal: np.ndarray, success: np.ndarray, kappa: float,
-                 failure_penalty: float | None, t_max: int, normalize: bool) -> tuple[np.ndarray, np.ndarray]:
+                 failure_penalty: float | None, t_max: int | np.ndarray, normalize: bool
+                 ) -> tuple[np.ndarray, np.ndarray]:
     """Spec §7.1 per chunk: -1, -kappa if steered, -C on failure/timeout (C defaults to 2 * t_max); success
-    is terminal with no bonus. Returns (reward, bootstrap mask)."""
+    is terminal with no bonus. t_max (max episode chunks) is a scalar or one value per row. Returns (reward,
+    bootstrap mask)."""
     c_fail = 2.0 * t_max if failure_penalty is None else float(failure_penalty)
     reward = -1.0 - kappa * steered - c_fail * (terminal & ~success)
     if normalize:

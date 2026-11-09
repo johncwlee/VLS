@@ -24,28 +24,32 @@ import hydra
 import numpy as np
 import torch
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import OmegaConf
 
 from residual.buffer import ReplayBuffer, chunk_reward, field_specs
 from residual.monitor import Monitor, Timer
 from residual.pi05 import Pi05
 from residual.qam_e import Context, QAMEAgent
-from residual.rollout import LABEL_SOURCE, VLS_ROOT, make_adapter, run_episode
+from residual.rollout import LABEL_SOURCE, VLS_ROOT, EnvPool, run_episode, task_specs
 
 log = logging.getLogger(__name__)
 MAX_CONSECUTIVE_ENV_ERRORS = 5
 VIDEO_FPS = 20
 
 
-@dataclass
+@dataclass(eq=False)  # identity hash: tasks key per-task dicts
 class Task:
-    index: int        # position in env.task_ids_filter (stored in the buffer)
+    index: int        # position in the run's task list (stored in the buffer)
+    suite: str        # LIBERO-PRO suite, e.g. libero_goal_task
     task_id: int      # LIBERO task id in the suite
     name: str
     text: str
-    adapter: object
+    t_max: int        # max episode chunks: reward normalization and the critic's time feature
     official_inits: np.ndarray
     train_inits: np.ndarray
+
+    @property
+    def label(self) -> str:
+        return f"{self.suite}_t{self.task_id}"
 
 
 def git_state(path: Path) -> dict:
@@ -59,16 +63,17 @@ class Trainer:
         self.cfg, self.run_dir, self.monitor = cfg, run_dir, monitor
         self.pi05 = Pi05(cfg.policy.pretrained_path, cfg.device)
         self.dims = self.pi05.dims(cfg.policy.exec_horizon, cfg.policy.num_inference_steps)
+        self.envs = EnvPool(cfg.env.max_open_envs)
         self.tasks = self._make_tasks()
-        max_steps = self.tasks[0].adapter._env[0]._max_episode_steps
-        self.t_max = math.ceil(max_steps / cfg.policy.exec_horizon)
+        self.t_max_by_task = np.array([t.t_max for t in self.tasks])
+        self.task_by_key = {(t.suite, t.task_id): t for t in self.tasks}
         self.agent = QAMEAgent(cfg, self.dims, self.pi05.velocity_and_hidden, self.pi05.action_low,
                                self.pi05.action_high).to(cfg.device)
         self.timer = Timer()
         self.agent.timer = self.timer
         if cfg.policy.residual_ckpt:
             self.agent.load_state_dict(torch.load(cfg.policy.residual_ckpt, weights_only=True)["agent"])
-        libero_env = self.tasks[0].adapter._env[0]
+        libero_env = self.adapter(self.tasks[0])._env[0]
         d = self.dims
         specs = field_specs((3, libero_env.observation_height, libero_env.observation_width), d.state_dim,
                             d.exec_horizon, d.action_dim, d.horizon, d.pad_dim, d.prefix_dim, d.ae_dim)
@@ -81,21 +86,22 @@ class Trainer:
 
     def _make_tasks(self) -> list[Task]:
         cfg = self.cfg
-        env_overrides = OmegaConf.to_container(cfg.env, resolve=True)
-        task_ids = env_overrides.pop("task_ids_filter")
-        init_dir = Path(cfg.split.train_init_dir).resolve() / cfg.env.suite_name
+        init_dir = Path(cfg.split.train_init_dir).resolve()
         tasks = []
-        for index, task_id in enumerate(task_ids):
-            adapter = make_adapter(env_overrides, task_id)
-            libero_env = adapter._env[0]
-            path = init_dir / f"{libero_env.task}.npy"
+        for index, (suite, task_id) in enumerate(task_specs(cfg.env)):
+            libero_env = self.envs.get(suite, task_id)._env[0]
+            path = init_dir / suite / f"{libero_env.task}.npy"
             if not path.exists():
-                raise SystemExit(f"Missing train init states {path}. Run from modules/VLS: ../../envs/vls/bin/python "
-                                 f"-m residual.make_train_inits env.suite_name={cfg.env.suite_name} "
-                                 f"env.task_ids_filter=[{task_id}]")
-            tasks.append(Task(index, task_id, libero_env.task, libero_env.task_description, adapter,
+                raise SystemExit(f"Missing train init states {path}. Run from modules/VLS with the same env.* "
+                                 f"overrides: ../../envs/vls/bin/python -m residual.make_train_inits")
+            t_max = math.ceil(libero_env._max_episode_steps / cfg.policy.exec_horizon)
+            tasks.append(Task(index, suite, task_id, libero_env.task, libero_env.task_description, t_max,
                               np.asarray(libero_env._init_states), np.load(path)))
+        log.info(f"{len(tasks)} tasks: {[t.label for t in tasks]}")
         return tasks
+
+    def adapter(self, task: Task):
+        return self.envs.get(task.suite, task.task_id)
 
     # ---------------------------------------------------------------- checkpoints
     def _save(self, name: str) -> None:
@@ -127,91 +133,106 @@ class Trainer:
                 "stage": self.state["stage"], **extra}
 
     # ---------------------------------------------------------------- rollouts
-    def returns_to_go(self, chunks: dict) -> np.ndarray:
+    def returns_to_go(self, chunks: dict, t_max: int) -> np.ndarray:
         r, _ = chunk_reward(chunks["steered"], chunks["terminal"], chunks["success"], self.cfg.reward.steer_kappa,
-                            self.cfg.reward.failure_penalty, self.t_max, self.cfg.reward.normalize)
+                            self.cfg.reward.failure_penalty, t_max, self.cfg.reward.normalize)
         out, g = np.zeros_like(r), 0.0
         for i in reversed(range(len(r))):  # every episode ends terminal (success, failure or timeout)
             g = r[i] + self.cfg.qam.discount * g
             out[i] = g
         return out
 
-    def collect(self, n: int, *, stage: int, rnd: int, online: bool, use_residual: bool, use_edit: bool) -> None:
+    def remaining(self, per_task: list[int], stage: int, rnd: int) -> list[Task]:
+        """Episodes still to collect, grouped by task so each env is opened once (resume counts the buffer)."""
+        plan = []
+        for task, target in zip(self.tasks, per_task, strict=True):
+            have = self.buffer.episode_count(stage=stage, round=rnd, suite=task.suite, task=task.task_id)
+            plan += [task] * max(0, target - have)
+        return plan
+
+    def collect(self, plan: list[Task], *, stage: int, rnd: int, online: bool, use_residual: bool,
+                use_edit: bool) -> None:
         cfg, errors, done = self.cfg, 0, 0
-        while done < n:
+        while done < len(plan):
             # Per-episode RNG keyed on the buffer's episode count: a resumed run continues the sequence instead of
             # replaying the init ids, held-out draws and noise of episodes collected after the last checkpoint.
             episode_rng = np.random.default_rng([cfg.seed, len(self.buffer.episodes), errors])
             torch.manual_seed(int(episode_rng.integers(2 ** 62)))
-            task = self.tasks[len(self.buffer.episodes) % len(self.tasks)]  # round robin
+            task = plan[done]
             init_id = int(episode_rng.integers(len(task.train_inits)))
             video = len(self.buffer.episodes) % cfg.logging.video_train_every_episodes == 0
             start = time.perf_counter()
             try:
-                ep = run_episode(task.adapter, self.pi05, self.agent, task_idx=task.index,
-                                 init_state=task.train_inits[init_id], t_max=self.t_max,
+                ep = run_episode(self.adapter(task), self.pi05, self.agent, task_idx=task.index,
+                                 init_state=task.train_inits[init_id], t_max=task.t_max,
                                  use_residual=use_residual, use_edit=use_edit, record_video=video)
             except Exception:  # an env failure drops this episode, not the run
                 errors += 1
-                self.monitor.episode({"stage": stage, "round": rnd, "task": task.task_id, "init_id": init_id,
-                                      "error": traceback.format_exc()})
-                log.exception(f"Episode failed (task {task.task_id}, train init {init_id}); dropped")
+                self.monitor.episode({"stage": stage, "round": rnd, "suite": task.suite, "task": task.task_id,
+                                      "init_id": init_id, "error": traceback.format_exc()})
+                log.exception(f"Episode failed ({task.label}, train init {init_id}); dropped")
                 if errors >= MAX_CONSECUTIVE_ENV_ERRORS:
                     raise
                 continue
             errors = 0
             heldout = (not online) and episode_rng.random() < cfg.offline.heldout_frac
-            ret = float(self.returns_to_go(ep.chunks)[0])
-            meta = {"stage": stage, "round": rnd, "task": task.task_id, "init_id": init_id, "success": ep.success,
-                    "steps": ep.steps, "label_source": LABEL_SOURCE}
+            ret = float(self.returns_to_go(ep.chunks, task.t_max)[0])
+            meta = {"stage": stage, "round": rnd, "suite": task.suite, "task": task.task_id, "init_id": init_id,
+                    "success": ep.success, "steps": ep.steps, "label_source": LABEL_SOURCE}
             self.buffer.add_episode(ep.chunks, meta, online=online, heldout=heldout)
             done += 1
             wall = time.perf_counter() - start
             self.monitor.episode({**meta, "chunks": len(ep.q), "return": ret, "q": ep.q, "heldout": heldout,
                                   "wall_time": wall, **ep.stats})
             self.monitor.log({"episode/success": float(ep.success), "episode/length": ep.steps, "episode/return": ret,
-                              "episode/task": task.task_id, "episode/init_id": init_id, "episode/wall_time": wall,
+                              "episode/task_index": task.index, "episode/init_id": init_id, "episode/wall_time": wall,
                               **{f"episode/{k}": v for k, v in ep.stats.items()}}, **self.axes())
             if ep.frames:
-                self.monitor.video(f"train_ep{len(self.buffer.episodes)}_t{task.task_id}_"
+                self.monitor.video(f"train_ep{len(self.buffer.episodes)}_{task.label}_"
                                    f"{'success' if ep.success else 'fail'}", ep.frames, VIDEO_FPS,
                                    cfg.logging.wandb.log_videos, **self.axes())
 
-    def evaluate(self, *, use_residual: bool, use_edit: bool, tag: str) -> float:
+    def evaluate(self, *, use_residual: bool, use_edit: bool, tag: str, episodes_per_task: int) -> float:
         """Official LIBERO-PRO init states; these episodes never enter the buffer."""
         cfg = self.cfg
         rows, successes, qs, rtgs, stats = [], defaultdict(list), [], [], defaultdict(list)
         for task in self.tasks:
-            for i in range(cfg.eval.episodes_per_task):
+            for i in range(episodes_per_task):
                 init_id = i % len(task.official_inits)
                 try:
-                    ep = run_episode(task.adapter, self.pi05, self.agent, task_idx=task.index,
-                                     init_state=task.official_inits[init_id], t_max=self.t_max,
+                    ep = run_episode(self.adapter(task), self.pi05, self.agent, task_idx=task.index,
+                                     init_state=task.official_inits[init_id], t_max=task.t_max,
                                      use_residual=use_residual, use_edit=use_edit,
                                      record_video=i < cfg.logging.video_eval_per_task)
                 except Exception:
-                    log.exception(f"Eval episode failed (task {task.task_id}, official init {init_id}); excluded")
-                    rows.append([task.task_id, init_id, "error", 0])
+                    log.exception(f"Eval episode failed ({task.label}, official init {init_id}); excluded")
+                    rows.append([task.suite, task.task_id, init_id, "error", 0])
                     continue
-                successes[task.task_id].append(ep.success)
-                rows.append([task.task_id, init_id, ep.success, ep.steps])
+                successes[task].append(ep.success)
+                rows.append([task.suite, task.task_id, init_id, ep.success, ep.steps])
                 qs += ep.q
-                rtgs += self.returns_to_go(ep.chunks).tolist()
+                rtgs += self.returns_to_go(ep.chunks, task.t_max).tolist()
                 for k, v in ep.stats.items():
                     stats[k].append(v)
                 stats["length"].append(ep.steps)
                 if ep.frames:
-                    self.monitor.video(f"eval_{tag}_r{self.state['round']}_t{task.task_id}_i{init_id}_"
+                    self.monitor.video(f"eval_{tag}_r{self.state['round']}_{task.label}_i{init_id}_"
                                        f"{'success' if ep.success else 'fail'}", ep.frames, VIDEO_FPS,
                                        cfg.logging.wandb.log_videos, **self.axes())
         overall = float(np.mean([s for v in successes.values() for s in v])) if successes else 0.0
-        metrics = {f"eval/{tag}/success": overall, **{f"eval/{tag}/success_task{t}": float(np.mean(v))
-                                                       for t, v in successes.items()}}
+        metrics = {f"eval/{tag}/success": overall}
+        by_suite = defaultdict(list)
+        for task, outcomes in successes.items():
+            metrics[f"eval/{tag}/success_{task.label}"] = float(np.mean(outcomes))
+            by_suite[task.suite] += outcomes
+        metrics.update({f"eval/{tag}/success_{suite}": float(np.mean(v)) for suite, v in by_suite.items()})
         metrics.update({f"eval/{tag}/{k}": float(np.mean(v)) for k, v in stats.items()})
         metrics.update(self._q_vs_return(np.array(qs), np.array(rtgs), f"eval/{tag}"))
         self.monitor.log(metrics, **self.axes())
-        self.monitor.table(f"{tag}_by_init", ["task", "init_id", "success", "steps"], rows, **self.axes())
-        log.info(f"Eval [{tag}] round {self.state['round']}: success {overall:.3f} {dict(successes)}")
+        self.monitor.table(f"{tag}_by_init", ["suite", "task", "init_id", "success", "steps"], rows, **self.axes())
+        per_suite = {suite: round(float(np.mean(v)), 3) for suite, v in by_suite.items()}
+        log.info(f"Eval [{tag}] round {self.state['round']} ({episodes_per_task} per task): success {overall:.3f} "
+                 f"per suite {per_suite} per task {[(t.label, round(float(np.mean(v)), 2)) for t, v in successes.items()]}")
         return overall
 
     @staticmethod
@@ -230,12 +251,13 @@ class Trainer:
         for ep in episodes:
             rows = np.arange(ep["start"], ep["start"] + ep["length"])
             data = self.buffer.get(rows, ["h_prefix", "state_norm", "step", "a_exec", "steered", "terminal", "success"])
+            t_max = self.task_by_key[(ep["suite"], ep["task"])].t_max
             ctx = Context(h_prefix=torch.from_numpy(data["h_prefix"]).float().to(self.cfg.device),
                           state=torch.from_numpy(data["state_norm"]).to(self.cfg.device),
-                          progress=torch.from_numpy(data["step"] / self.t_max).float().to(self.cfg.device), base=None)
+                          progress=torch.from_numpy(data["step"] / t_max).float().to(self.cfg.device), base=None)
             q = self.agent.pessimistic_q(ctx, torch.from_numpy(data["a_exec"]).to(self.cfg.device)).cpu().numpy()
             qs += q.tolist()
-            rtgs += self.returns_to_go(data).tolist()
+            rtgs += self.returns_to_go(data, t_max).tolist()
             (q_success if ep["success"] else q_fail).append(q[0])
         metrics = self._q_vs_return(np.array(qs), np.array(rtgs), "gate")
         metrics.update({"gate/q0_success_episodes": float(np.mean(q_success)) if q_success else float("nan"),
@@ -246,7 +268,7 @@ class Trainer:
     def _context(self, rows: dict) -> Context:
         tasks = [self.tasks[i].text for i in rows["task"]]
         batch = self.pi05.preprocess(rows["image"], rows["image2"], rows["state"], tasks)
-        return self.pi05.context(batch, torch.from_numpy(rows["step"] / self.t_max).float())
+        return self.pi05.context(batch, torch.from_numpy(rows["step"] / self.t_max_by_task[rows["task"]]).float())
 
     def train(self, n_updates: int, offline_ratio: float, stage_ckpt: bool) -> None:
         cfg, device = self.cfg, self.cfg.device
@@ -261,7 +283,8 @@ class Trainer:
             with self.timer("prefix_encode"):
                 ctx, next_ctx = self._context(rows), self._context(next_rows)
             reward, mask = chunk_reward(rows["steered"], rows["terminal"], rows["success"], cfg.reward.steer_kappa,
-                                        cfg.reward.failure_penalty, self.t_max, cfg.reward.normalize)
+                                        cfg.reward.failure_penalty, self.t_max_by_task[rows["task"]],
+                                        cfg.reward.normalize)
             with self.timer("total_agent"):
                 info, hist = self.agent.update(ctx, torch.from_numpy(rows["a_exec"]).to(device),
                                                torch.from_numpy(reward).to(device), torch.from_numpy(mask).to(device),
@@ -311,11 +334,12 @@ class Trainer:
         cfg, s = self.cfg, self.state
         if s["stage"] == 1:
             if cfg.eval.baseline_at_start and not s["baseline_done"]:
-                self.evaluate(use_residual=False, use_edit=False, tag="baseline")
+                self.evaluate(use_residual=False, use_edit=False, tag="baseline",
+                              episodes_per_task=cfg.eval.final_episodes_per_task)
                 s["baseline_done"] = True
                 self._save("last.pt")
-            remaining = cfg.offline.episodes_per_task * len(self.tasks) - self.buffer.episode_count(stage=1)
-            self.collect(remaining, stage=1, rnd=0, online=False, use_residual=False, use_edit=False)
+            plan = self.remaining([cfg.offline.episodes_per_task] * len(self.tasks), stage=1, rnd=0)
+            self.collect(plan, stage=1, rnd=0, online=False, use_residual=False, use_edit=False)
             s["stage"] = 2
             self._save("last.pt")
         if s["stage"] == 2:
@@ -329,35 +353,44 @@ class Trainer:
             start = time.perf_counter()
             if cfg.online.reinit_each_round:
                 self._load(self.run_dir / "stage2.pt", full=False)
-            have = self.buffer.episode_count(stage=3, round=rnd)
-            self.collect(cfg.online.episodes_per_round - have, stage=3, rnd=rnd, online=True,
+            self.collect(self.remaining(self._round_targets(rnd), stage=3, rnd=rnd), stage=3, rnd=rnd, online=True,
                          use_residual=True, use_edit=True)
             self.train(cfg.online.updates_per_round, cfg.online.offline_ratio, stage_ckpt=False)
             s["round"] = rnd
             self._log_round(rnd, time.perf_counter() - start)
             self.gate()
-            if rnd % cfg.eval.every_rounds == 0 or rnd == cfg.online.rounds:
-                success = self.evaluate(use_residual=True, use_edit=True, tag="policy")
+            final = rnd == cfg.online.rounds
+            if rnd % cfg.eval.every_rounds == 0 or final:
+                episodes = cfg.eval.final_episodes_per_task if final else cfg.eval.episodes_per_task
+                success = self.evaluate(use_residual=True, use_edit=True, tag="policy", episodes_per_task=episodes)
                 if success > s["best_eval"]:
                     s["best_eval"] = success
                     self._save("best.pt")
             self._save("last.pt")
         if cfg.online.rounds == 0:  # no online phase (e.g. eval-only with policy.residual_ckpt): evaluate once
-            self.evaluate(use_residual=True, use_edit=True, tag="policy")
+            self.evaluate(use_residual=True, use_edit=True, tag="policy",
+                          episodes_per_task=cfg.eval.final_episodes_per_task)
+
+    def _round_targets(self, rnd: int) -> list[int]:
+        """Split online.episodes_per_round over the tasks; the remainder rotates so every task gets equal data."""
+        n, per_round = len(self.tasks), self.cfg.online.episodes_per_round
+        base, extra = divmod(per_round, n)
+        return [base + int((i - rnd * extra) % n < extra) for i in range(n)]
 
     def _log_round(self, rnd: int, wall: float) -> None:
-        episodes = [ep for ep in self.buffer.episodes if ep["stage"] == 3 and ep["round"] == rnd]
-        metrics = {"round/wall_time": wall, "round/mean_length": float(np.mean([ep["steps"] for ep in episodes]))}
-        zero = 0
-        for task in self.tasks:
-            outcomes = [ep["success"] for ep in episodes if ep["task"] == task.task_id]
-            rate = float(np.mean(outcomes)) if outcomes else float("nan")
-            metrics[f"round/train_success_task{task.task_id}"] = rate
-            if outcomes and rate == 0:
-                zero += 1
-                log.warning(f"Round {rnd}: task {task.task_id} had 0 successes; every return is identical, so QAM "
-                            f"has nothing to learn from it")
-        metrics["round/zero_success_tasks"] = zero
+        this_round = [ep for ep in self.buffer.episodes if ep["stage"] == 3 and ep["round"] == rnd]
+        metrics = {"round/wall_time": wall, "round/mean_length": float(np.mean([ep["steps"] for ep in this_round])),
+                   "round/train_success": float(np.mean([ep["success"] for ep in this_round]))}
+        for suite in {t.suite for t in self.tasks}:
+            outcomes = [ep["success"] for ep in this_round if ep["suite"] == suite]
+            metrics[f"round/train_success_{suite}"] = float(np.mean(outcomes)) if outcomes else float("nan")
+        # A task whose every training episode so far failed gives QAM nothing to learn (identical returns).
+        succeeded = {(ep["suite"], ep["task"]) for ep in self.buffer.episodes if ep["success"]}
+        never = [t.label for t in self.tasks if (t.suite, t.task_id) not in succeeded]
+        metrics["round/never_succeeded_tasks"] = len(never)
+        if never:
+            log.warning(f"Round {rnd}: {len(never)}/{len(self.tasks)} tasks have no successful training episode yet, "
+                        f"so QAM has nothing to learn from them: {never}")
         self.monitor.log(metrics, **self.axes())
 
 

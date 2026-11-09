@@ -1,13 +1,22 @@
 # Residual π0.5 + QAM-E on LIBERO-PRO: the single source of truth for every training hyperparameter.
-# Run: ./run_residual.sh [overrides]   (repo root), e.g. ./run_residual.sh qam.inv_temp=1.0 env.task_ids_filter=[3]
+# Run: ./run_residual.sh [overrides]   (repo root), e.g. ./run_residual.sh env.perturbation=swap qam.inv_temp=1.0
 # Conventions: actions are in π0.5's MEAN_STD-normalized space unless a key says "raw"; a "chunk" is one executed
 # sub-chunk (policy.exec_horizon env steps) and is the RL time step. Spec = plans/residual_rough_plan-11-08.md.
 seed: 0
 device: cuda
 
-env:                          # merged over VLS configs/backend/libero.yaml (LIBERO defaults live there)
-  suite_name: libero_object_swap
-  task_ids_filter: [0]        # trained round-robin; pick tasks where π0.5 succeeds ~10-90% on train inits
+env:                          # one run = one LIBERO-PRO perturbation type across suites; one multi-task residual
+                              # (π0.5 itself is one policy for all four LIBERO suites). LIBERO env defaults live in
+                              # VLS configs/backend/libero.yaml.
+  perturbation: task          # task | swap (position) | object | lan; each suite is <base suite>_<perturbation>
+  suites: [libero_spatial, libero_object, libero_goal, libero_10]
+  task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]   # task ids used in every suite ...
+  task_ids_by_suite:          # ... unless set per suite, e.g. env.task_ids_by_suite.libero_10=[1,4]
+    libero_spatial: null
+    libero_object: null
+    libero_goal: null
+    libero_10: null
+  max_open_envs: 12           # open LIBERO envs kept in memory (~0.5-1.5 GB RAM each; reopening one takes 1-2 s)
 
 policy:
   pretrained_path: lerobot/pi05_libero_finetuned_v044
@@ -18,7 +27,8 @@ policy:
 
 split:                        # train/test init states (spec §11.2); test = the official 50 per task
   train_init_dir: ../../data/residual/train_inits   # relative to modules/VLS
-  num_train_inits: 1000       # per task; spec suggests 500-2000
+  num_train_inits: 1000       # per task; spec suggests 500-2000 (0.3-0.6 s per layout, 5-10 min per task)
+  workers: 12                 # make_train_inits processes in parallel (~1 GB RAM each)
   seed: 100000                # base seed for train layouts (state i uses seed + i); official inits are unseeded
   min_pos_dist_m: 0.001       # overlap check: a train init whose objects ALL lie within this position
   min_rot_dist_deg: 1.0       #   and this angle of one official init fails the split
@@ -66,13 +76,15 @@ qam:
   use_target_grad: true       # the adjoint starts from the target critic's dQ/da (QAM default)
 
 offline:                      # spec Stages 1-2
-  episodes_per_task: 100      # π0.5-only rollouts (residual zero, edit off) into the protected pool
+  episodes_per_task: 20       # π0.5-only rollouts (residual zero, edit off) into the protected pool;
+                              # 40 tasks x 20 x ~10 s ≈ 2.5 h
   heldout_frac: 0.1           # episodes kept out of training for the Stage 2 gate (Q vs return-to-go)
   updates: 2000               # offline QAM-E updates (~2 h at batch 32 on one RTX 5090, measured 2026-11-08)
 
 online:                       # spec Stage 3 (no agent yet)
   rounds: 50
-  episodes_per_round: 20      # π0.5 + residual + edit on train inits, into the online pool
+  episodes_per_round: 40      # π0.5 + residual + edit on train inits, into the online pool; split evenly over
+                              # tasks (40 = one per task for the default 40 tasks, ~7 min)
   updates_per_round: 200      # ~13 min at batch 32; collection adds ~8 s per episode
   offline_ratio: 0.5          # fraction of each batch from the protected pool (spec §9: 50:50, RLPD-style)
   reinit_each_round: false    # true = restart residual/critic/edit from stage2.pt every round (spec §10 comparison)
@@ -80,13 +92,14 @@ online:                       # spec Stage 3 (no agent yet)
 train:
   batch_size: 32              # QAM uses 256. π0.5's prefix is recomputed for s and s' every update: ~30 ms per
                               # observation, so ~1.9 s prefix + ~1.9 s QAM-E per update at 32 (RTX 5090, 2026-11-08)
-  buffer_capacity: 100000     # chunks; disk-backed memmap in the run dir (~0.4 MB per chunk)
+  buffer_capacity: 150000     # chunks; disk-backed memmap in the run dir (~0.4 MB per chunk, ~60 GB at capacity)
   ckpt_every_updates: 1000    # last.pt during Stage 2 (Stage 3 also saves after every round)
   resume_dir: null            # a previous run dir: continue from its last.pt and buffer
 
 eval:                         # official LIBERO-PRO init states through the VLS LiberoAdapter; never added to the buffer
   every_rounds: 5
-  episodes_per_task: 50       # 50 = every official init once
+  episodes_per_task: 10       # official inits 0..9 during training (40 tasks ≈ 1 h per eval)
+  final_episodes_per_task: 50 # all 50 official inits for the baseline and the last round (≈ 5.5 h for 40 tasks)
   baseline_at_start: true     # evaluate plain π0.5 first, as the reference line
 
 logging:
@@ -99,10 +112,10 @@ logging:
     mode: online              # online | offline (sync later with `wandb sync`) | disabled
     project: residual-qam-e
     entity: null
-    group: ${env.suite_name}
+    group: ${env.perturbation}
     tags: []
     log_videos: true
 
 hydra:
   run:
-    dir: outputs/residual/${env.suite_name}/${now:%Y-%m-%d_%H-%M-%S}   # modules/VLS/outputs -> results/vls
+    dir: outputs/residual/${env.perturbation}/${now:%Y-%m-%d_%H-%M-%S}   # modules/VLS/outputs -> results/vls
