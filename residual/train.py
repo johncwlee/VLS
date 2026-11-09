@@ -342,6 +342,8 @@ class Trainer:
                     s["best_eval"] = success
                     self._save("best.pt")
             self._save("last.pt")
+        if cfg.online.rounds == 0:  # no online phase (e.g. eval-only with policy.residual_ckpt): evaluate once
+            self.evaluate(use_residual=True, use_edit=True, tag="policy")
 
     def _log_round(self, rnd: int, wall: float) -> None:
         episodes = [ep for ep in self.buffer.episodes if ep["stage"] == 3 and ep["round"] == rnd]

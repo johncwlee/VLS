@@ -219,6 +219,8 @@ class QAMEAgent(nn.Module):
         for i in reversed(range(len(xs))):
             s = i * h
             xi = xs[i].detach().requires_grad_(True)
+            # Intentionally t_q = s + h (one step later than the forward drift), as in qam.py adj_matching:96.
+            # Linearizing at s instead steered less on the analytic toy (mean 0.52 vs 0.58 at K=10, target 0.667).
             t = torch.full((bsize,), 1.0 - (s + h), device=adj.device)
             with torch.enable_grad():
                 v, _ = self.base_fn(ctx.base, xi, t)
