@@ -28,7 +28,9 @@ policy:
 split:                        # train/test init states (spec §11.2); test = the official 50 per task
   train_init_dir: ../../data/residual/train_inits   # relative to modules/VLS
   num_train_inits: 1000       # per task; spec suggests 500-2000 (0.3-0.6 s per layout, 5-10 min per task)
-  workers: 12                 # make_train_inits processes in parallel (~1 GB RAM each)
+  workers: 12                 # make_train_inits: tasks generated in parallel, one process each (<1 GB RAM)
+  attempts: 3                 # make_train_inits: tries per task before reporting it failed
+  only: null                  # internal: set by make_train_inits for its per-task child processes
   seed: 100000                # base seed for train layouts (state i uses seed + i); official inits are unseeded
   min_pos_dist_m: 0.001       # overlap check: a train init whose objects ALL lie within this position
   min_rot_dist_deg: 1.0       #   and this angle of one official init fails the split
