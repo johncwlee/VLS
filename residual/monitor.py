@@ -54,6 +54,13 @@ def _scalar(value):
     return value
 
 
+def save_video(run_dir: Path, name: str, frames: list[np.ndarray], fps: int) -> Path:
+    path = run_dir / "videos" / f"{name}.mp4"
+    path.parent.mkdir(exist_ok=True)
+    imageio.mimsave(path, frames, fps=fps)
+    return path
+
+
 class Monitor:
     def __init__(self, cfg, run_dir: Path):
         self.run_dir = run_dir
@@ -109,13 +116,11 @@ class Monitor:
             import wandb
             self.wandb.log({f"eval/{name}": wandb.Table(columns=columns, data=rows), **axes})
 
-    def video(self, name: str, frames: list[np.ndarray], fps: int, upload: bool, **axes) -> None:
-        path = self.run_dir / "videos" / f"{name}.mp4"
-        path.parent.mkdir(exist_ok=True)
-        imageio.mimsave(path, frames, fps=fps)
+    def video(self, path: Path, upload: bool, **axes) -> None:
+        """Upload a video that `save_video` wrote (on any rank)."""
         if upload and self.wandb is not None:
             import wandb
-            self.wandb.log({f"video/{name.split('_')[0]}": wandb.Video(str(path), format="mp4"), **axes})
+            self.wandb.log({f"video/{path.stem.split('_')[0]}": wandb.Video(str(path), format="mp4"), **axes})
 
     def close(self) -> None:
         self.metrics.close()

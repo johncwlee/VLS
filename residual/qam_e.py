@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -285,6 +286,9 @@ class QAMEAgent(nn.Module):
             opt.zero_grad(set_to_none=True)
         with self.timer("backward"):
             sum(losses.values()).backward()
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            with self.timer("all_reduce"):
+                info = self._average_over_ranks(info)
         max_norm = self.cfg.qam.clip_grad_norm
         for name, opt in self.optims.items():
             params = [p for g in opt.param_groups for p in g["params"]]
@@ -300,6 +304,24 @@ class QAMEAgent(nn.Module):
                 tp.lerp_(p, tau)
         hist["q"] = info.pop("_q", torch.zeros(0))
         return info, hist
+
+    def _average_over_ranks(self, info: dict) -> dict:
+        """Data parallel: every loss is a mean over this rank's equal share of the batch, so the averaged gradient is
+        the full-batch gradient and every rank takes the same step. Metrics are averaged too (min/max become rank
+        means), so the non-finite check agrees on every rank; "_" entries are per-sample and stay local."""
+        world = dist.get_world_size()
+        for p in self.parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad)
+                p.grad /= world  # SUM then divide: gloo (CPU) has no AVG
+        out = {}
+        for k, v in info.items():
+            if not k.startswith("_"):
+                v = v.detach().float().to(self.action_low.device)
+                dist.all_reduce(v)
+                v = v / world
+            out[k] = v
+        return out
 
     # ---------------------------------------------------------------- checkpoint helpers
     def optim_state_dict(self) -> dict:

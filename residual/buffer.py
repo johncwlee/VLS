@@ -44,7 +44,8 @@ def field_specs(image_shape: tuple[int, ...], state_dim: int, exec_horizon: int,
 
 
 class ReplayBuffer:
-    def __init__(self, directory: Path, capacity: int, specs: dict):
+    def __init__(self, directory: Path, capacity: int, specs: dict, readonly: bool = False):
+        """readonly: a view of a buffer another process writes (multi-GPU ranks > 0); `reload` picks up its episodes."""
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.meta_path = self.dir / "meta.json"
@@ -57,8 +58,13 @@ class ReplayBuffer:
         else:
             self.size, self.episodes = 0, []
         self.capacity, self.specs = capacity, specs
-        self.data = {k: np.memmap(self.dir / f"{k}.bin", dtype=d, mode="r+" if resume else "w+", shape=(capacity, *s))
+        self.data = {k: np.memmap(self.dir / f"{k}.bin", dtype=d, mode="r" if readonly else "r+" if resume else "w+", shape=(capacity, *s))
                      for k, (d, s) in specs.items()}
+        self._refresh_index()
+
+    def reload(self) -> None:
+        meta = json.loads(self.meta_path.read_text())
+        self.size, self.episodes = meta["size"], meta["episodes"]
         self._refresh_index()
 
     def _refresh_index(self) -> None:

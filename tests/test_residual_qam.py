@@ -121,3 +121,39 @@ def test_non_finite_update_does_not_step():
     info, _ = agent.update(context(4), action, torch.full((4,), float("nan")), torch.ones(4), context(4))
     assert not torch.isfinite(info["update/critic/loss"])
     assert all(torch.equal(before[k], v) for k, v in agent.state_dict().items())
+
+
+def _split_batch_update(rank: int | None = None, world: int = 1, init_file: str = "", out: str = "") -> dict:
+    """One update on a fixed batch of 8 (rank r of `world` takes its contiguous share). Noise is zeroed so the
+    losses are deterministic and two half-batch ranks must match one full-batch process exactly."""
+    import torch.distributed as dist
+    if rank is not None:  # spawned process; the full-batch run in the pytest process uses monkeypatch
+        torch.randn_like = torch.zeros_like
+        dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    torch.manual_seed(0)
+    agent = make_agent()
+    g = torch.Generator().manual_seed(1)
+    feats = [torch.randn(8, d, generator=g) for d in (DIMS.prefix_dim, DIMS.state_dim, DIMS.prefix_dim, DIMS.state_dim)]
+    action = torch.randn(8, DIMS.exec_horizon, DIMS.action_dim, generator=g)
+    reward, mask = -torch.rand(8, generator=g), (torch.rand(8, generator=g) > 0.3).float()
+    share = slice((rank or 0) * 8 // world, ((rank or 0) + 1) * 8 // world)
+    ctx = Context(h_prefix=feats[0][share], state=feats[1][share], progress=torch.zeros(8)[share], base=None)
+    next_ctx = Context(h_prefix=feats[2][share], state=feats[3][share], progress=torch.zeros(8)[share], base=None)
+    info, _ = agent.update(ctx, action[share], reward[share], mask[share], next_ctx)
+    result = {"params": agent.state_dict(), "critic_loss": info["update/critic/loss"].item()}
+    if rank is not None:
+        if rank == 0:
+            torch.save(result, out)
+        dist.destroy_process_group()
+    return result
+
+
+def test_data_parallel_update_matches_full_batch(tmp_path, monkeypatch):
+    import torch.multiprocessing as mp
+    monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
+    full = _split_batch_update()
+    mp.spawn(_split_batch_update, args=(2, str(tmp_path / "init"), str(tmp_path / "rank0.pt")), nprocs=2)
+    split = torch.load(tmp_path / "rank0.pt", weights_only=True)
+    assert split["critic_loss"] == pytest.approx(full["critic_loss"], rel=1e-5)
+    for k, v in full["params"].items():
+        torch.testing.assert_close(split["params"][k], v, rtol=1e-5, atol=1e-6, msg=k)

@@ -92,8 +92,9 @@ online:                       # spec Stage 3 (no agent yet)
   reinit_each_round: false    # true = restart residual/critic/edit from stage2.pt every round (spec §10 comparison)
 
 train:
-  batch_size: 32              # QAM uses 256. π0.5's prefix is recomputed for s and s' every update: ~30 ms per
-                              # observation, so ~1.9 s prefix + ~1.9 s QAM-E per update at 32 (RTX 5090, 2026-11-08)
+  batch_size: 32              # global, split evenly over GPUs (-g). QAM uses 256. π0.5's prefix is recomputed for s and
+                              # s' every update: ~30 ms per observation, so ~1.9 s prefix + ~1.9 s QAM-E per update at
+                              # 32 (RTX 5090, 2026-11-08)
   buffer_capacity: 150000     # chunks; disk-backed memmap in the run dir (~0.4 MB per chunk, ~60 GB at capacity)
   ckpt_every_updates: 1000    # last.pt during Stage 2 (Stage 3 also saves after every round)
   resume_dir: null            # a previous run dir: continue from its last.pt and buffer
