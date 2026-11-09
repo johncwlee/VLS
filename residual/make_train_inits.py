@@ -3,7 +3,8 @@
 Same procedure as LIBERO-PRO's notebooks/generate_init_states.py (sample placements on reset, store the sim state
 with no settling) but seeded: state i uses seed `split.seed + i`. It covers the same tasks as training (env.* in
 hyperparameters.yaml: one perturbation type across suites), runs each task in its own process (split.workers at a
-time, split.attempts tries each), skips tasks whose file already exists, and never touches the official init files.
+time, split.attempts tries each), skips tasks whose file already exists, drops layouts that duplicate an official
+one, and never touches the official init files.
 Run from modules/VLS:
     ../../envs/vls/bin/python -m residual.make_train_inits                   # env.perturbation=task, all suites
     ../../envs/vls/bin/python -m residual.make_train_inits env.perturbation=swap
@@ -47,7 +48,8 @@ def pairwise_max_distance(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.
     return pos, rot
 
 
-def overlap_report(train: np.ndarray, test: np.ndarray, min_pos: float, min_rot: float) -> dict:
+def overlap_report(train: np.ndarray, test: np.ndarray, min_pos: float, min_rot: float) -> tuple[dict, np.ndarray]:
+    """Returns (report, duplicate mask over train layouts)."""
     pos, rot = pairwise_max_distance(train, test)
     duplicates = ((pos < min_pos) & (rot < min_rot)).any(1)
     nearest = pos.argmin(1)
@@ -58,7 +60,8 @@ def overlap_report(train: np.ndarray, test: np.ndarray, min_pos: float, min_rot:
     return {"num_train": len(train), "num_test": len(test), "duplicates": int(duplicates.sum()),
             "nn_pos_m": {k: float(np.percentile(nn_pos, q)) for k, q in quantiles.items()},
             "nn_rot_deg": {k: float(np.percentile(nn_rot, q)) for k, q in quantiles.items()},
-            "official_vs_official_nn_pos_m": {k: float(np.percentile(test_pos.min(1), q)) for k, q in quantiles.items()}}
+            "official_vs_official_nn_pos_m": {k: float(np.percentile(test_pos.min(1), q)) for k, q in quantiles.items()}
+            }, duplicates
 
 
 def generate(suite: str, task_id: int, split) -> dict:
@@ -74,7 +77,7 @@ def generate(suite: str, task_id: int, split) -> dict:
     out_dir = Path(split.train_init_dir).resolve() / suite
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{task.name}.npy"
-    if path.exists() and len(np.load(path)) == split.num_train_inits:
+    if path.exists():
         return {"suite": suite, "task_id": task_id, "skipped": str(path)}
     official = np.asarray(get_task_init_states(task_suite, task_id))
     bddl = Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
@@ -85,13 +88,14 @@ def generate(suite: str, task_id: int, split) -> dict:
         env.reset()
         states.append(env.get_sim_state())
     states = np.stack(states)
-    report = overlap_report(object_poses(env, states), object_poses(env, official),
-                            split.min_pos_dist_m, split.min_rot_dist_deg)
-    report.update(suite=suite, task_id=task_id, task=task.name, seed=split.seed)
+    report, duplicates = overlap_report(object_poses(env, states), object_poses(env, official),
+                                        split.min_pos_dist_m, split.min_rot_dist_deg)
+    # A layout whose every object lies within the thresholds of an official test layout would be "the same
+    # episode" as a test one: drop it from training (the file then holds slightly fewer than num_train_inits).
+    report.update(suite=suite, task_id=task_id, task=task.name, seed=split.seed, kept=int((~duplicates).sum()),
+                  dropped_seeds=[split.seed + int(i) for i in np.flatnonzero(duplicates)])
     (out_dir / f"{task.name}.overlap.json").write_text(json.dumps(report, indent=2))
-    if report["duplicates"]:
-        raise SystemExit(f"{report['duplicates']} train init states duplicate an official test state; change split.seed")
-    np.save(path, states)
+    np.save(path, states[~duplicates])
     return report
 
 
