@@ -14,6 +14,7 @@ import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlparse
 
 import imageio
 import numpy as np
@@ -27,13 +28,21 @@ AXES = {"update": "update_step", "buffer": "update_step", "hist": "update_step",
         "round": "round", "eval": "round", "gate": "round", "video": "round"}
 
 
+# Hosts `wandb login` writes to ~/.netrc: the classic API, and W&B's CoreWeave API (wandb >= 0.30).
+WANDB_NETRC_HOSTS = ("api.wandb.ai", "api.forge.coreweave.com")
+
+
 def _wandb_credentials() -> bool:
     if os.environ.get("WANDB_API_KEY"):
         return True
+    hosts = list(WANDB_NETRC_HOSTS)
+    if os.environ.get("WANDB_BASE_URL"):
+        hosts.append(urlparse(os.environ["WANDB_BASE_URL"]).hostname)
     try:
-        return netrc.netrc().authenticators("api.wandb.ai") is not None
+        entries = netrc.netrc()
     except (FileNotFoundError, netrc.NetrcParseError):
         return False
+    return any(entries.authenticators(h) is not None for h in hosts)
 
 
 def _scalar(value):
