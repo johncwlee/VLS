@@ -14,7 +14,7 @@ import torch
 from omegaconf import OmegaConf
 from torch import nn
 
-from residual.buffer import chunk_reward
+from residual.buffer import ReplayBuffer, chunk_reward, field_specs
 from residual.networks import cap
 from residual.qam_e import Context, Dims, QAMEAgent
 
@@ -114,6 +114,25 @@ def test_chunk_reward():
     np.testing.assert_allclose(r_norm, np.array([-1, -1.5, -1, -31, -31.5]) / 10)
 
 
+def test_buffer_resume_and_readonly_view(tmp_path):
+    """A reopened buffer (resume, or a rank > 0 view) sees the same episodes and pools; a layout change is refused."""
+    specs = field_specs((3, 4, 4), DIMS)
+    buf = ReplayBuffer(tmp_path, 20, specs)
+    view = ReplayBuffer(tmp_path, 20, specs, readonly=True)
+    chunks = {"a_exec": np.ones((3, DIMS.exec_horizon, DIMS.action_dim), np.float32), "steered": np.zeros(3, bool),
+              "terminal": np.array([False, False, True]), "success": np.array([False, False, True])}
+    buf.add_episode(chunks, {"task": 0}, online=False, heldout=False)
+    buf.add_episode(chunks, {"task": 0}, online=True, heldout=False)
+    view.reload()
+    for other in (ReplayBuffer(tmp_path, 20, specs), view):
+        assert other.size == 6 and len(other.episodes) == 2
+        np.testing.assert_array_equal(other.protected_idx, [0, 1, 2])
+        np.testing.assert_array_equal(other.online_idx, [3, 4, 5])
+        np.testing.assert_array_equal(other.get(np.array([5, 0]), ["terminal"])["terminal"], [True, False])
+    with pytest.raises(ValueError):
+        ReplayBuffer(tmp_path, 21, specs)
+
+
 def test_non_finite_update_does_not_step():
     agent = make_agent(edit={"scale": 0.1})
     before = {k: v.clone() for k, v in agent.state_dict().items()}
@@ -123,12 +142,16 @@ def test_non_finite_update_does_not_step():
     assert all(torch.equal(before[k], v) for k, v in agent.state_dict().items())
 
 
+def _zero_noise(self, ctx: Context) -> torch.Tensor:
+    return torch.zeros(ctx.h_prefix.shape[0], DIMS.horizon, DIMS.pad_dim)
+
+
 def _split_batch_update(rank: int | None = None, world: int = 1, init_file: str = "", out: str = "") -> dict:
     """One update on a fixed batch of 8 (rank r of `world` takes its contiguous share). Noise is zeroed so the
     losses are deterministic and two half-batch ranks must match one full-batch process exactly."""
     import torch.distributed as dist
     if rank is not None:  # spawned process; the full-batch run in the pytest process uses monkeypatch
-        torch.randn_like = torch.zeros_like
+        torch.randn_like, QAMEAgent.noise = torch.zeros_like, _zero_noise
         dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
     torch.manual_seed(0)
     agent = make_agent()
@@ -151,6 +174,7 @@ def _split_batch_update(rank: int | None = None, world: int = 1, init_file: str 
 def test_data_parallel_update_matches_full_batch(tmp_path, monkeypatch):
     import torch.multiprocessing as mp
     monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
+    monkeypatch.setattr(QAMEAgent, "noise", _zero_noise)
     full = _split_batch_update()
     mp.spawn(_split_batch_update, args=(2, str(tmp_path / "init"), str(tmp_path / "rank0.pt")), nprocs=2)
     split = torch.load(tmp_path / "rank0.pt", weights_only=True)

@@ -154,7 +154,7 @@ class QAMEAgent(nn.Module):
                     ) -> tuple[Tensor, dict]:
         q_cfg = self.cfg.qam
         with torch.no_grad():
-            next_action = self.act(next_ctx, torch.randn_like(self._noise_like(next_ctx)))["a_exec"]
+            next_action = self.act(next_ctx, self.noise(next_ctx))["a_exec"]
             next_q = self.pessimistic_q(next_ctx, next_action, target=True)
             target = reward + q_cfg.discount * mask * next_q
         qs = self.critic(self.feat(ctx), action)
@@ -167,9 +167,10 @@ class QAMEAgent(nn.Module):
             "_q": qs.detach().flatten(),
         }
 
-    def _noise_like(self, ctx: Context) -> Tensor:
+    def noise(self, ctx: Context) -> Tensor:
+        """Flow start x_1 ~ N(0, I) over the padded chunk, one per batch row."""
         d = self.dims
-        return torch.empty(ctx.h_prefix.shape[0], d.horizon, d.pad_dim, device=ctx.h_prefix.device)
+        return torch.randn(ctx.h_prefix.shape[0], d.horizon, d.pad_dim, device=ctx.h_prefix.device)
 
     def terminal_adjoint(self, ctx: Context, a_full: Tensor) -> Tensor:
         """-inv_temp * dQ/da on the executed slice; zero on unexecuted positions and padded dims."""
@@ -185,7 +186,7 @@ class QAMEAgent(nn.Module):
     def adjoint(self, ctx: Context) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, dict]:
         """Memoryless rollout of the composed flow + lean adjoint through the base (qam.py adj_matching)."""
         steps, h = self.dims.flow_steps, 1.0 / self.dims.flow_steps
-        x = torch.randn_like(self._noise_like(ctx))
+        x = self.noise(ctx)
         bsize = x.shape[0]
         xs, v_vlas, aes = [], [], []
         with torch.no_grad(), self.timer("adjoint_rollout"):
@@ -251,7 +252,7 @@ class QAMEAgent(nn.Module):
 
     def edit_losses(self, ctx: Context) -> tuple[Tensor, Tensor, dict, dict]:
         with torch.no_grad():
-            x0, _ = self.sample_chunk(ctx, torch.randn_like(self._noise_like(ctx)), self.cfg.qam.inv_temp > 0)
+            x0, _ = self.sample_chunk(ctx, self.noise(ctx), self.cfg.qam.inv_temp > 0)
             chunk = self.clip(self.exec_slice(x0))
         feat = self.feat(ctx).detach()
         edit, log_prob = self.edit(feat, chunk)

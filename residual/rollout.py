@@ -88,7 +88,7 @@ def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_st
         start = time.perf_counter()
         batch = pi05.preprocess(image, image2, state, obs["task"])
         ctx = pi05.context(batch, torch.tensor([chunk / t_max]))
-        noise = torch.randn(1, dims.horizon, dims.pad_dim, device=pi05.device)
+        noise = agent.noise(ctx)
         out = agent.act(ctx, noise, use_residual=use_residual, use_edit=use_edit, with_base=True)
         raw = pi05.unnormalize(out["a_exec"])[0]
         policy_time += time.perf_counter() - start

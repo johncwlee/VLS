@@ -8,13 +8,10 @@ import contextlib
 import csv
 import json
 import logging
-import netrc
-import os
 import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
-from urllib.parse import urlparse
 
 import imageio
 import numpy as np
@@ -26,23 +23,6 @@ log = logging.getLogger(__name__)
 # metric prefix -> step axis
 AXES = {"update": "update_step", "buffer": "update_step", "hist": "update_step", "episode": "env_step",
         "round": "round", "eval": "round", "gate": "round", "video": "round"}
-
-
-# Hosts `wandb login` writes to ~/.netrc: the classic API, and W&B's CoreWeave API (wandb >= 0.30).
-WANDB_NETRC_HOSTS = ("api.wandb.ai", "api.forge.coreweave.com")
-
-
-def _wandb_credentials() -> bool:
-    if os.environ.get("WANDB_API_KEY"):
-        return True
-    hosts = list(WANDB_NETRC_HOSTS)
-    if os.environ.get("WANDB_BASE_URL"):
-        hosts.append(urlparse(os.environ["WANDB_BASE_URL"]).hostname)
-    try:
-        entries = netrc.netrc()
-    except (FileNotFoundError, netrc.NetrcParseError):
-        return False
-    return any(entries.authenticators(h) is not None for h in hosts)
 
 
 def _scalar(value):
@@ -68,12 +48,18 @@ class Monitor:
         self.episodes = (run_dir / "episodes.jsonl").open("a")
         self.wandb = None
         wcfg = cfg.logging.wandb
+        self.upload_videos = wcfg.log_videos
         if wcfg.mode == "disabled":
             return
-        if wcfg.mode == "online" and not _wandb_credentials():
-            raise SystemExit("wandb mode=online but no credentials: run `envs/vls/bin/wandb login` once (or put "
-                             "WANDB_API_KEY in .env), or pass logging.wandb.mode=offline to log locally.")
         import wandb
+        if wcfg.mode == "online":
+            try:  # wandb's own key lookup; timeout so a TTY (tmux) run fails instead of waiting at the login prompt
+                logged_in = wandb.login(verify=False, timeout=1)
+            except wandb.errors.UsageError:  # no key and no TTY
+                logged_in = False
+            if not logged_in:
+                raise SystemExit("wandb mode=online but no credentials: run `envs/vls/bin/wandb login` once (or put "
+                                 "WANDB_API_KEY in .env), or pass logging.wandb.mode=offline to log locally.")
         id_file = run_dir / "wandb_id.txt"
         run_id = id_file.read_text().strip() if id_file.exists() else uuid.uuid4().hex[:8]
         id_file.write_text(run_id)
@@ -116,9 +102,9 @@ class Monitor:
             import wandb
             self.wandb.log({f"eval/{name}": wandb.Table(columns=columns, data=rows), **axes})
 
-    def video(self, path: Path, upload: bool, **axes) -> None:
+    def video(self, path: Path, **axes) -> None:
         """Upload a video that `save_video` wrote (on any rank)."""
-        if upload and self.wandb is not None:
+        if self.upload_videos and self.wandb is not None:
             import wandb
             self.wandb.log({f"video/{path.stem.split('_')[0]}": wandb.Video(str(path), format="mp4"), **axes})
 

@@ -10,8 +10,12 @@ online chunk. Held-out episodes are never sampled for training.
 import json
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from residual.qam_e import Dims
 
 
 def chunk_reward(steered: np.ndarray, terminal: np.ndarray, success: np.ndarray, kappa: float,
@@ -27,17 +31,16 @@ def chunk_reward(steered: np.ndarray, terminal: np.ndarray, success: np.ndarray,
     return reward.astype(np.float32), (~terminal).astype(np.float32)
 
 
-def field_specs(image_shape: tuple[int, ...], state_dim: int, exec_horizon: int, action_dim: int, horizon: int,
-                pad_dim: int, prefix_dim: int, ae_dim: int) -> dict[str, tuple[str, tuple[int, ...]]]:
+def field_specs(image_shape: tuple[int, ...], d: "Dims") -> dict[str, tuple[str, tuple[int, ...]]]:
     return {
         "image": ("uint8", image_shape), "image2": ("uint8", image_shape),  # env-preprocessed (flipped) cameras
-        "state": ("float32", (state_dim,)),       # raw proprio, re-normalized by the policy preprocessor
-        "state_norm": ("float32", (state_dim,)),  # as the policy saw it (critic features without a π0.5 pass)
+        "state": ("float32", (d.state_dim,)),       # raw proprio, re-normalized by the policy preprocessor
+        "state_norm": ("float32", (d.state_dim,)),  # as the policy saw it (critic features without a π0.5 pass)
         "task": ("int16", ()), "episode": ("int32", ()), "step": ("int16", ()),
-        "a_exec": ("float32", (exec_horizon, action_dim)),  # normalized, clipped, edited: the TD action
-        "a_base": ("float32", (exec_horizon, action_dim)),  # π0.5 alone from the same noise (diagnostic only)
-        "noise": ("float16", (horizon, pad_dim)),
-        "h_prefix": ("float16", (prefix_dim,)), "latent": ("float16", (ae_dim,)),
+        "a_exec": ("float32", (d.exec_horizon, d.action_dim)),  # normalized, clipped, edited: the TD action
+        "a_base": ("float32", (d.exec_horizon, d.action_dim)),  # π0.5 alone from the same noise (diagnostic only)
+        "noise": ("float16", (d.horizon, d.pad_dim)),
+        "h_prefix": ("float16", (d.prefix_dim,)), "latent": ("float16", (d.ae_dim,)),
         "steered": ("bool", ()), "trigger": ("uint8", ()), "terminal": ("bool", ()), "success": ("bool", ()),
         "protected": ("bool", ()), "online": ("bool", ()), "heldout": ("bool", ()),
     }
@@ -50,17 +53,19 @@ class ReplayBuffer:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.meta_path = self.dir / "meta.json"
         resume = self.meta_path.exists()
+        self.capacity = capacity
+        self.layout = {k: [d, list(s)] for k, (d, s) in specs.items()}  # as stored in meta.json
         if resume:
             meta = json.loads(self.meta_path.read_text())
-            if meta["capacity"] != capacity or meta["specs"] != {k: [d, list(s)] for k, (d, s) in specs.items()}:
+            if meta["capacity"] != capacity or meta["specs"] != self.layout:
                 raise ValueError(f"Buffer at {self.dir} was created with a different capacity or layout")
-            self.size, self.episodes = meta["size"], meta["episodes"]
+        self.data = {k: np.memmap(self.dir / f"{k}.bin", dtype=d, mode="r" if readonly else "r+" if resume else "w+",
+                                  shape=(capacity, *s)) for k, (d, s) in specs.items()}
+        if resume:
+            self.reload()
         else:
             self.size, self.episodes = 0, []
-        self.capacity, self.specs = capacity, specs
-        self.data = {k: np.memmap(self.dir / f"{k}.bin", dtype=d, mode="r" if readonly else "r+" if resume else "w+", shape=(capacity, *s))
-                     for k, (d, s) in specs.items()}
-        self._refresh_index()
+            self._refresh_index()
 
     def reload(self) -> None:
         meta = json.loads(self.meta_path.read_text())
@@ -94,7 +99,7 @@ class ReplayBuffer:
         self.size += length
         tmp = self.meta_path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"capacity": self.capacity, "size": self.size, "episodes": self.episodes,
-                                   "specs": {k: [d, list(s)] for k, (d, s) in self.specs.items()}}))
+                                   "specs": self.layout}))
         os.replace(tmp, self.meta_path)
         self._refresh_index()
 

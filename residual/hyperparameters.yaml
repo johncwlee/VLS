@@ -33,7 +33,7 @@ split:                        # train/test init states (spec §11.2); test = the
   only: null                  # internal: set by make_train_inits for its per-task child processes
   seed: 100000                # base seed for train layouts (state i uses seed + i); official inits are unseeded
   min_pos_dist_m: 0.001       # overlap check: a train init whose objects ALL lie within this position
-  min_rot_dist_deg: 1.0       #   and this angle of one official init fails the split
+  min_rot_dist_deg: 1.0       #   and this angle of one official init is a duplicate and is dropped
 
 reward:                       # per chunk (spec §7.1): -1 always, -kappa if steered, -C on failure/timeout;
                               # success ends the episode with no bonus
@@ -42,7 +42,6 @@ reward:                       # per chunk (spec §7.1): -1 always, -kappa if ste
   normalize: true             # divide rewards by T_max (max episode chunks) so returns sit in ~[-3, 0]; inv_temp assumes it
 
 residual:                     # v_phi, added to π0.5's velocity at every flow step (spec §3.2, no keypoints yet)
-  arch: mlp                   # v0 only; the v1 token transformer comes later
   hidden_dims: [512, 512, 512, 512]   # QAM / RL²-VLA actor size
   activation: silu
   layer_norm: true

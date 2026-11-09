@@ -29,6 +29,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from hydra.core.hydra_config import HydraConfig
+from lerobot.utils.random_utils import set_seed
 
 from residual.buffer import ReplayBuffer, chunk_reward, field_specs
 from residual.monitor import Monitor, Timer, save_video
@@ -77,7 +78,6 @@ class Trainer:
         self.envs = EnvPool(cfg.env.max_open_envs)
         self.tasks = self._make_tasks()
         self.t_max_by_task = np.array([t.t_max for t in self.tasks])
-        self.task_by_key = {(t.suite, t.task_id): t for t in self.tasks}
         self.agent = QAMEAgent(cfg, self.dims, self.pi05.velocity_and_hidden, self.pi05.action_low,
                                self.pi05.action_high).to(cfg.device)
         self.timer = Timer()
@@ -85,9 +85,7 @@ class Trainer:
         if cfg.policy.residual_ckpt:
             self.agent.load_state_dict(torch.load(cfg.policy.residual_ckpt, weights_only=True)["agent"])
         libero_env = self.adapter(self.tasks[0])._env[0]
-        d = self.dims
-        specs = field_specs((3, libero_env.observation_height, libero_env.observation_width), d.state_dim,
-                            d.exec_horizon, d.action_dim, d.horizon, d.pad_dim, d.prefix_dim, d.ae_dim)
+        specs = field_specs((3, libero_env.observation_height, libero_env.observation_width), self.dims)
         if self.rank == 0:
             self.buffer = ReplayBuffer(run_dir / "buffer", cfg.train.buffer_capacity, specs)
         self._barrier()
@@ -165,7 +163,8 @@ class Trainer:
             self.rng.bit_generator.state = payload["rng"]["numpy"]
             random.setstate(payload["rng"]["python"])
             torch.set_rng_state(payload["rng"]["torch"])
-            torch.cuda.set_rng_state_all(payload["rng"]["cuda"])
+            # one state per GPU the saver saw; a torchrun rank sees one GPU, so restore only as many as exist
+            torch.cuda.set_rng_state_all(payload["rng"]["cuda"][:torch.cuda.device_count()])
 
     # ---------------------------------------------------------------- counters derived from the buffer
     @property
@@ -177,9 +176,14 @@ class Trainer:
                 "stage": self.state["stage"], **extra}
 
     # ---------------------------------------------------------------- rollouts
+    def reward(self, rows: dict, t_max) -> tuple[np.ndarray, np.ndarray]:
+        """(reward, bootstrap mask) per chunk; t_max is a scalar or one value per row."""
+        r = self.cfg.reward
+        return chunk_reward(rows["steered"], rows["terminal"], rows["success"], r.steer_kappa, r.failure_penalty,
+                            t_max, r.normalize)
+
     def returns_to_go(self, chunks: dict, t_max: int) -> np.ndarray:
-        r, _ = chunk_reward(chunks["steered"], chunks["terminal"], chunks["success"], self.cfg.reward.steer_kappa,
-                            self.cfg.reward.failure_penalty, t_max, self.cfg.reward.normalize)
+        r, _ = self.reward(chunks, t_max)
         out, g = np.zeros_like(r), 0.0
         for i in reversed(range(len(r))):  # every episode ends terminal (success, failure or timeout)
             g = r[i] + self.cfg.qam.discount * g
@@ -256,7 +260,7 @@ class Trainer:
                           "episode/wall_time": result["wall"], **{f"episode/{k}": v for k, v in ep.stats.items()}},
                          **self.axes())
         if result["video"] is not None:
-            self.monitor.video(result["video"], self.cfg.logging.wandb.log_videos, **self.axes())
+            self.monitor.video(result["video"], **self.axes())
 
     def evaluate(self, *, use_residual: bool, use_edit: bool, tag: str, episodes_per_task: int) -> float:
         """Official LIBERO-PRO init states, split over ranks; these episodes never enter the buffer."""
@@ -283,7 +287,7 @@ class Trainer:
                 stats[k].append(v)
             stats["length"].append(ep.steps)
             if r["video"] is not None:
-                self.monitor.video(r["video"], cfg.logging.wandb.log_videos, **self.axes())
+                self.monitor.video(r["video"], **self.axes())
         overall = float(np.mean([s for v in successes.values() for s in v])) if successes else 0.0
         metrics = {f"eval/{tag}/success": overall}
         by_suite = defaultdict(list)
@@ -335,8 +339,9 @@ class Trainer:
         qs, rtgs, q_success, q_fail = [], [], [], []
         for ep in episodes:
             rows = np.arange(ep["start"], ep["start"] + ep["length"])
-            data = self.buffer.get(rows, ["h_prefix", "state_norm", "step", "a_exec", "steered", "terminal", "success"])
-            t_max = self.task_by_key[(ep["suite"], ep["task"])].t_max
+            data = self.buffer.get(rows, ["h_prefix", "state_norm", "step", "task", "a_exec", "steered", "terminal",
+                                          "success"])
+            t_max = int(self.t_max_by_task[data["task"][0]])
             ctx = Context(h_prefix=torch.from_numpy(data["h_prefix"]).float().to(self.cfg.device),
                           state=torch.from_numpy(data["state_norm"]).to(self.cfg.device),
                           progress=torch.from_numpy(data["step"] / t_max).float().to(self.cfg.device), base=None)
@@ -359,8 +364,9 @@ class Trainer:
         cfg, device = self.cfg, self.cfg.device
         obs_keys = ["image", "image2", "state", "task", "step"]
         window = defaultdict(list)
-        share = cfg.train.batch_size // self.world
-        mine = slice(self.rank * share, (self.rank + 1) * share)  # this rank's part of the batch
+        # strided: sample() puts protected rows before online ones, so a contiguous share would give rank 0
+        # (which logs batch metrics) only offline data
+        mine = slice(self.rank, None, self.world)
         for _ in range(n_updates):
             idx = next_idx = None
             if self.rank == 0:
@@ -372,9 +378,7 @@ class Trainer:
                 next_rows = self.buffer.get(next_idx[mine], obs_keys)
             with self.timer("prefix_encode"):
                 ctx, next_ctx = self._context(rows), self._context(next_rows)
-            reward, mask = chunk_reward(rows["steered"], rows["terminal"], rows["success"], cfg.reward.steer_kappa,
-                                        cfg.reward.failure_penalty, self.t_max_by_task[rows["task"]],
-                                        cfg.reward.normalize)
+            reward, mask = self.reward(rows, self.t_max_by_task[rows["task"]])
             with self.timer("total_agent"):
                 info, hist = self.agent.update(ctx, torch.from_numpy(rows["a_exec"]).to(device),
                                                torch.from_numpy(reward).to(device), torch.from_numpy(mask).to(device),
@@ -385,32 +389,37 @@ class Trainer:
                 self._nan_guard(info, idx, next_idx)
             if self.rank > 0:  # info is already averaged over ranks; rank 0 logs and checkpoints
                 continue
-            for k, v in info.items():
-                v = v.detach().float().cpu()
-                if v.numel() == 1:
-                    window[k].append(v.item())
-                else:  # per-flow-step vectors
-                    for i, x in enumerate(v.tolist()):
-                        window[f"{k}/{i}"].append(x)
-            window["buffer/batch_protected_frac"].append(float(np.isin(idx, self.buffer.protected_idx).mean()))
-            # reward / terminal stats are over rank 0's share of the batch
-            window["buffer/batch_reward_mean"].append(float(reward.mean()))
-            window["buffer/batch_terminal_frac"].append(float(rows["terminal"].mean()))
-            if step % cfg.logging.log_every_updates == 0:
-                metrics = {k: float(np.mean(v)) for k, v in window.items()}
-                metrics.update({f"update/time/{k}": t / cfg.logging.log_every_updates
-                                for k, t in self.timer.pop().items()})
-                metrics.update({"update/time/gpu_mem_peak_gb": torch.cuda.max_memory_allocated() / 2 ** 30,
-                                "buffer/protected_chunks": len(self.buffer.protected_idx),
-                                "buffer/online_chunks": len(self.buffer.online_idx), "update/lr": cfg.qam.lr})
-                torch.cuda.reset_peak_memory_stats()
-                self.monitor.log(metrics, **self.axes())
-                window.clear()
-            if step % cfg.logging.hist_every_updates == 0:
-                for name, values in hist.items():
-                    self.monitor.histogram(name, values, **self.axes())
+            self._log_update(window, info, hist, idx, reward, rows["terminal"])
             if stage_ckpt and step % cfg.train.ckpt_every_updates == 0:
                 self._save("last.pt")
+
+    def _log_update(self, window: dict, info: dict, hist: dict, idx: np.ndarray, reward: np.ndarray,
+                    terminal: np.ndarray) -> None:
+        """Accumulate one update's scalars into window; flush averages / histograms on the logging cadence."""
+        cfg, step = self.cfg, self.state["update_step"]
+        for k, v in info.items():
+            v = v.detach().float().cpu()
+            if v.numel() == 1:
+                window[k].append(v.item())
+            else:  # per-flow-step vectors
+                for i, x in enumerate(v.tolist()):
+                    window[f"{k}/{i}"].append(x)
+        window["buffer/batch_protected_frac"].append(float(np.isin(idx, self.buffer.protected_idx).mean()))
+        # reward / terminal stats are over rank 0's rows of the batch
+        window["buffer/batch_reward_mean"].append(float(reward.mean()))
+        window["buffer/batch_terminal_frac"].append(float(terminal.mean()))
+        if step % cfg.logging.log_every_updates == 0:
+            metrics = {k: float(np.mean(v)) for k, v in window.items()}
+            metrics.update({f"update/time/{k}": t / cfg.logging.log_every_updates for k, t in self.timer.pop().items()})
+            metrics.update({"update/time/gpu_mem_peak_gb": torch.cuda.max_memory_allocated() / 2 ** 30,
+                            "buffer/protected_chunks": len(self.buffer.protected_idx),
+                            "buffer/online_chunks": len(self.buffer.online_idx), "update/lr": cfg.qam.lr})
+            torch.cuda.reset_peak_memory_stats()
+            self.monitor.log(metrics, **self.axes())
+            window.clear()
+        if step % cfg.logging.hist_every_updates == 0:
+            for name, values in hist.items():
+                self.monitor.histogram(name, values, **self.axes())
 
     def _nan_guard(self, info: dict, idx: np.ndarray, next_idx: np.ndarray) -> None:
         bad = [k for k, v in info.items() if not torch.isfinite(v).all()]
@@ -441,6 +450,7 @@ class Trainer:
             self.train(cfg.offline.updates - s["update_step"], offline_ratio=1.0, stage_ckpt=True)
             self.gate()
             self._save("stage2.pt")
+            self._barrier()  # ranks > 0 load stage2.pt each round when reinit_each_round
             s["stage"] = 3
             self._save("last.pt")
         while s["round"] < cfg.online.rounds:
@@ -513,9 +523,7 @@ def main(cfg) -> None:
             root.removeHandler(handler)
     if cfg.train.resume_dir or rank > 0:  # keep one train.log per run dir (and rank) across restarts
         root.addHandler(logging.FileHandler(run_dir / ("train.log" if rank == 0 else f"train_rank{rank}.log")))
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
+    set_seed(cfg.seed)
     monitor = None
     if rank == 0:
         meta_path = run_dir / "meta.json"
