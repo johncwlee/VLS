@@ -591,12 +591,20 @@ class LiberoEnv(gym.Env):
         
         return observation
 
-    def reset(self, seed=None, **kwargs):
+    def reset(self, seed=None, options=None, **kwargs):
         super().reset(seed=seed)
         self._env.seed(seed)
-        if self.init_states and self._init_states is not None:
-            self._env.set_init_state(self._init_states[self._init_state_id])
-        raw_obs = self._env.reset()
+        init_state = (options or {}).get("init_state")
+        if init_state is not None:
+            # Official LIBERO order: reset() samples a layout, then set_init_state() overwrites it.
+            self._env.reset()
+            raw_obs = self._env.set_init_state(init_state)
+        else:
+            # Legacy VLS order (init_state_mode=seeded_random): reset() re-samples placements after
+            # set_init_state(), so this init state is discarded and the layout follows `seed`.
+            if self.init_states and self._init_states is not None:
+                self._env.set_init_state(self._init_states[self._init_state_id])
+            raw_obs = self._env.reset()
 
         # After reset, objects may be unstable (slightly floating, intersecting, etc.).
         # Step the simulator with a no-op action for a few frames so everything settles.
@@ -791,6 +799,9 @@ class LiberoAdapter(BaseEnvAdapter):
         # LIBERO-PRO related attributes
         self.suite_name = env_config["suite_name"]
         self.task_num = len(self._env)
+        self.init_state_mode = env_config.get("init_state_mode", "official")  # see configs/backend/libero.yaml
+        if self.init_state_mode not in ("official", "seeded_random"):
+            raise ValueError(f"init_state_mode must be 'official' or 'seeded_random', got {self.init_state_mode!r}")
 
         # total number of episodes to collect, must divide evenly by the number of tasks for desired suites
         self.total_episodes_num = env_config.get("episode_num", self.task_num)
@@ -1563,7 +1574,13 @@ class LiberoAdapter(BaseEnvAdapter):
         
         # Get current environment and reset it
         current_env = self._env[self.current_task_idx]
-        result = current_env.reset(**kwargs)
+        options = dict(kwargs.pop("options", None) or {})
+        init_state_id = None
+        if self.init_state_mode == "official" and "init_state" not in options:
+            # Episode i of a task starts from the task's stored init state i (wrapping after 50).
+            init_state_id = (self.current_episode_idx % self.episodes_per_task) % len(current_env._init_states)
+            options["init_state"] = current_env._init_states[init_state_id]
+        result = current_env.reset(options=options, **kwargs)
         
         # Cache robot state from observation
         if isinstance(result, tuple):
@@ -1579,7 +1596,8 @@ class LiberoAdapter(BaseEnvAdapter):
         info['task_description'] = getattr(current_env, 'task_description', '')
         info['task_name'] = getattr(current_env, 'task', '')
         info['episode_idx'] = self.current_episode_idx
-        
+        info['init_state_id'] = init_state_id
+
         return obs, info
     
     def get_obs(self) -> Dict:

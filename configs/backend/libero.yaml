@@ -21,6 +21,15 @@ libero:
   visualization_width: 640  # Resolution for VLM/video (high-res for quality)
   visualization_height: 640
   init_states: true
+  # Which starting layout each episode uses.
+  #   official:      the LIBERO / LIBERO-PRO protocol. reset() samples a layout, then set_init_state() overwrites it
+  #                  with the task's stored init state; episode i of a task uses state i % 50. Comparable to
+  #                  published LIBERO-PRO numbers. Default since 2026-11-08.
+  #   seeded_random: legacy VLS behaviour. set_init_state() ran before reset(), and reset() re-samples object
+  #                  placements, so the stored init state was discarded and every episode started from a random
+  #                  layout drawn from its episode seed (torch.randint in main.py). All VLS results produced before
+  #                  2026-11-08 used this mode; select it to reproduce them.
+  init_state_mode: official
   num_steps_wait: 10
   vlm_camera: agentview
   

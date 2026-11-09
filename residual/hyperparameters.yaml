@@ -1,0 +1,108 @@
+# Residual π0.5 + QAM-E on LIBERO-PRO: the single source of truth for every training hyperparameter.
+# Run: ./run_residual.sh [overrides]   (repo root), e.g. ./run_residual.sh qam.inv_temp=1.0 env.task_ids_filter=[3]
+# Conventions: actions are in π0.5's MEAN_STD-normalized space unless a key says "raw"; a "chunk" is one executed
+# sub-chunk (policy.exec_horizon env steps) and is the RL time step. Spec = plans/residual_rough_plan-11-08.md.
+seed: 0
+device: cuda
+
+env:                          # merged over VLS configs/backend/libero.yaml (LIBERO defaults live there)
+  suite_name: libero_object_swap
+  task_ids_filter: [0]        # trained round-robin; pick tasks where π0.5 succeeds ~10-90% on train inits
+
+policy:
+  pretrained_path: lerobot/pi05_libero_finetuned_v044
+  num_inference_steps: 10     # flow steps; also QAM's flow_steps
+  exec_horizon: 10            # actions executed per chunk before replanning (VLS executes 10 of the 50 predicted);
+                              # also the Q-chunk length the critic and the edit act on
+  residual_ckpt: null         # load trained residual/critic/edit weights (e.g. eval-only with online.rounds=0)
+
+split:                        # train/test init states (spec §11.2); test = the official 50 per task
+  train_init_dir: ../../data/residual/train_inits   # relative to modules/VLS
+  num_train_inits: 1000       # per task; spec suggests 500-2000
+  seed: 100000                # base seed for train layouts (state i uses seed + i); official inits are unseeded
+  min_pos_dist_m: 0.001       # overlap check: a train init whose objects ALL lie within this position
+  min_rot_dist_deg: 1.0       #   and this angle of one official init fails the split
+
+reward:                       # per chunk (spec §7.1): -1 always, -kappa if steered, -C on failure/timeout;
+                              # success ends the episode with no bonus
+  steer_kappa: 0.0            # help cost per steered chunk; no steering until the agent exists; spec sweep {0, 0.5, 1, 2, 4}
+  failure_penalty: null       # C_fail; must exceed max episode chunks so any failure ranks below any success; null = 2 * T_max
+  normalize: true             # divide rewards by T_max (max episode chunks) so returns sit in ~[-3, 0]; inv_temp assumes it
+
+residual:                     # v_phi, added to π0.5's velocity at every flow step (spec §3.2, no keypoints yet)
+  arch: mlp                   # v0 only; the v1 token transformer comes later
+  hidden_dims: [512, 512, 512, 512]   # QAM / RL²-VLA actor size
+  activation: silu
+  layer_norm: true
+  time_emb_dim: 128           # sinusoidal flow-time embedding
+  prefix_proj_dim: 512        # pooled prefix features (2048) are projected to this before the concat
+  cap_c: 0.5                  # soft cap ||v_phi|| <= cap_c * ||v_vla|| per horizon step; null = off; spec sweep {0.25, 0.5, 1.0, null}
+
+critic:                       # Q(s, executed chunk) ensemble (spec §7.2); features = pooled prefix + state (+ progress)
+  hidden_dims: [512, 512, 512, 512]
+  activation: gelu            # QAM default
+  layer_norm: true
+  num_qs: 10                  # ensemble size (QAM default); its std drives pessimism and, later, the critic alarm
+  time_feature: true          # append chunk index / T_max: timeouts are terminal failures, so value depends on time left
+
+edit:                         # QAM-E action-space edit of the executed chunk
+  scale: 0.1                  # edit = scale * tanh(.) in normalized units (QAM README, QAM_EDIT); 0 = plain QAM
+  hidden_dims: [512, 512, 512, 512]
+  activation: gelu
+  target_entropy_multiplier: 0.5   # target entropy = -multiplier * (exec_horizon * action_dim), as in QAM
+  init_alpha: 1.0             # initial entropy temperature (auto-tuned)
+
+qam:
+  inv_temp: 0.3               # trust in the critic (1/alpha): larger moves the residual further from π0.5.
+                              # 0.3 = QAM default. RL²-VLA's 0.02-0.1 were tuned on unnormalized returns, about
+                              # T_max times larger than ours. Sweep {0.1, 0.3, 1, 3}. 0 = sample π0.5 only.
+  rho: 0.5                    # pessimistic target: mean(Q) - rho * std(Q) over the ensemble (QAM default)
+  discount: 0.99              # per chunk (spec §7.2: 0.99-0.995)
+  tau: 0.005                  # target-critic Polyak rate
+  lr: 3.0e-4                  # Adam, every module
+  clip_grad_norm: 1.0         # per-module grad-norm clip; null = off
+  clip_actions: true          # clip chunks to the env's raw [-1, 1] bounds mapped into normalized space
+                              # (NOT [-1, 1] normalized, which would cap rotation at ~1 std)
+  use_target_grad: true       # the adjoint starts from the target critic's dQ/da (QAM default)
+
+offline:                      # spec Stages 1-2
+  episodes_per_task: 100      # π0.5-only rollouts (residual zero, edit off) into the protected pool
+  heldout_frac: 0.1           # episodes kept out of training for the Stage 2 gate (Q vs return-to-go)
+  updates: 2000               # offline QAM-E updates (~2 h at batch 32 on one RTX 5090, measured 2026-11-08)
+
+online:                       # spec Stage 3 (no agent yet)
+  rounds: 50
+  episodes_per_round: 20      # π0.5 + residual + edit on train inits, into the online pool
+  updates_per_round: 200      # ~13 min at batch 32; collection adds ~8 s per episode
+  offline_ratio: 0.5          # fraction of each batch from the protected pool (spec §9: 50:50, RLPD-style)
+  reinit_each_round: false    # true = restart residual/critic/edit from stage2.pt every round (spec §10 comparison)
+
+train:
+  batch_size: 32              # QAM uses 256. π0.5's prefix is recomputed for s and s' every update: ~30 ms per
+                              # observation, so ~1.9 s prefix + ~1.9 s QAM-E per update at 32 (RTX 5090, 2026-11-08)
+  buffer_capacity: 100000     # chunks; disk-backed memmap in the run dir (~0.4 MB per chunk)
+  ckpt_every_updates: 1000    # last.pt during Stage 2 (Stage 3 also saves after every round)
+  resume_dir: null            # a previous run dir: continue from its last.pt and buffer
+
+eval:                         # official LIBERO-PRO init states through the VLS LiberoAdapter; never added to the buffer
+  every_rounds: 5
+  episodes_per_task: 50       # 50 = every official init once
+  baseline_at_start: true     # evaluate plain π0.5 first, as the reference line
+
+logging:
+  log_every_updates: 50       # update scalars are averaged over this window
+  hist_every_updates: 1000
+  video_eval_per_task: 4      # first N eval episodes per task (successes and failures)
+  video_train_every_episodes: 50
+  nan_guard: true             # on NaN/inf in any update metric: dump batch indices + agent state to debug/ and stop
+  wandb:
+    mode: online              # online | offline (sync later with `wandb sync`) | disabled
+    project: residual-qam-e
+    entity: null
+    group: ${env.suite_name}
+    tags: []
+    log_videos: true
+
+hydra:
+  run:
+    dir: outputs/residual/${env.suite_name}/${now:%Y-%m-%d_%H-%M-%S}   # modules/VLS/outputs -> results/vls
