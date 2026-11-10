@@ -44,10 +44,24 @@ def test_zero_residual_sampler_matches_stock_sample_actions(pi05, agent, batch):
     ctx = pi05.context(batch, torch.zeros(2))
     noise = noise_for(agent)
     ours, _ = agent.sample_chunk(ctx, noise, use_residual=True)  # zero-init residual
-    images, img_masks = pi05.policy._preprocess_images(batch)
-    stock = pi05.model.sample_actions(images, img_masks, batch[OBS_LANGUAGE_TOKENS],
-                                      batch[OBS_LANGUAGE_ATTENTION_MASK], noise=noise.clone())
+    stock = pi05.model.sample_actions(*pi05.prefix_inputs(batch), noise=noise.clone())
     torch.testing.assert_close(ours, stock, atol=1e-5, rtol=0)
+    # Untrimmed prefix (empty camera and prompt padding kept): bf16 rounding only. Measured 2026-11-09: 1.6e-2,
+    # vs 1.2e-2 for the stock sampler at batch 1 vs batch 2.
+    images, img_masks = pi05.policy._preprocess_images(batch)
+    untrimmed = pi05.model.sample_actions(images, img_masks, batch[OBS_LANGUAGE_TOKENS],
+                                          batch[OBS_LANGUAGE_ATTENTION_MASK], noise=noise.clone())
+    torch.testing.assert_close(ours, untrimmed, atol=3e-2, rtol=0)
+
+
+def test_base_rows_on_repeated_prefix_match_base_sample(pi05, agent, batch):
+    """act(with_base) runs the base flow as extra rows over a batch-repeated copy of the prefix KV cache."""
+    ctx = pi05.context(batch, torch.zeros(2))
+    noise = noise_for(agent)
+    _, stats = agent.sample_chunk(ctx, noise, use_residual=True, with_base=True)
+    base, _ = agent.sample_chunk(ctx, noise, use_residual=False)
+    # batch 4 vs batch 2 changes bf16 rounding (measured 3.1e-3 on 2026-11-09); a row on the wrong prefix is off by ~2
+    torch.testing.assert_close(stats["x_base"], base, atol=1e-2, rtol=0)
 
 
 def test_qam_convention_base_rollout_matches_openpi_sampling(pi05, agent, batch):

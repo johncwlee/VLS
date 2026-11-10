@@ -78,6 +78,21 @@ def test_zero_init_residual_is_exactly_the_base():
     assert torch.equal(with_residual, base_only)
 
 
+def test_act_base_rows_match_separate_samples():
+    """act(with_base) integrates the base as extra batch rows of the residual sample; both must match solo samples."""
+    torch.manual_seed(0)
+    agent = make_agent()
+    for p in agent.residual.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    noise = torch.randn(4, DIMS.horizon, DIMS.pad_dim)
+    out = agent.act(context(4), noise, with_base=True)
+    composed, _ = agent.sample_chunk(context(4), noise, use_residual=True)
+    base, _ = agent.sample_chunk(context(4), noise, use_residual=False)
+    torch.testing.assert_close(out["a_exec"], agent.exec_slice(composed))
+    torch.testing.assert_close(out["a_base"], agent.exec_slice(base))
+    assert not torch.allclose(out["a_exec"], out["a_base"])
+
+
 def test_cap_bounds_residual_per_token():
     raw, v_vla = 10 * torch.randn(64, 50, 7), torch.randn(64, 50, 7)
     capped, saturated = cap(raw, v_vla, 0.5)

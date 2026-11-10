@@ -107,35 +107,44 @@ class QAMEAgent(nn.Module):
 
     # ---------------------------------------------------------------- sampling (openpi convention)
     @torch.no_grad()
-    def sample_chunk(self, ctx: Context, noise: Tensor, use_residual: bool) -> tuple[Tensor, dict]:
-        """Euler ODE t: 1 -> 0 exactly as lerobot's PI05Pytorch.sample_actions, plus v_phi when use_residual."""
+    def sample_chunk(self, ctx: Context, noise: Tensor, use_residual: bool, with_base: bool = False
+                     ) -> tuple[Tensor, dict]:
+        """Euler ODE t: 1 -> 0 exactly as lerobot's PI05Pytorch.sample_actions, plus v_phi when use_residual.
+        with_base also integrates the plain base flow from the same noise as extra batch rows of the same base calls
+        (cheaper than a second sample); it is returned as stats["x_base"]. The base state must support .repeat(n)."""
         steps, bsize = self.dims.flow_steps, noise.shape[0]
         dt = torch.tensor(-1.0 / steps, dtype=torch.float32, device=noise.device)
         time = torch.tensor(1.0, dtype=torch.float32, device=noise.device)
-        x, latent, ratios, sats = noise, None, [], []
+        base, x = ctx.base, noise
+        if with_base:
+            base, x = (base.repeat(2) if base is not None else None), torch.cat([noise, noise])
+        latent, ratios, sats = None, [], []
         while time >= -dt / 2:
-            t = time.expand(bsize)
-            v, hidden = self.base_fn(ctx.base, x, t)
-            ae_pool = hidden.mean(1)
+            t = time.expand(x.shape[0])
+            v, hidden = self.base_fn(base, x, t)
+            ae_pool = hidden[:bsize].mean(1)
             latent = ae_pool if latent is None else latent  # first flow step: RL²-VLA / SAFE latent
             if use_residual:
-                v_phi, sat = self._residual(x, t, v, ae_pool, ctx)
-                ratios.append(v_phi.norm(dim=-1).mean() / (v[..., : self.dims.action_dim].norm(dim=-1).mean() + 1e-8))
+                v_own = v[:bsize]
+                v_phi, sat = self._residual(x[:bsize], t[:bsize], v_own, ae_pool, ctx)
+                ratios.append(v_phi.norm(dim=-1).mean() / (v_own[..., : self.dims.action_dim].norm(dim=-1).mean() + 1e-8))
                 sats.append(sat.float().mean())
-                v = v + self._pad(v_phi)
+                v = torch.cat([v_own + self._pad(v_phi), v[bsize:]])
             x = x + dt * v
             time = time + dt
         stats = {"latent": latent}
         if use_residual:
             stats.update(ratio=torch.stack(ratios).mean(), sat=torch.stack(sats).mean())
-        return x, stats
+        if with_base:
+            stats["x_base"] = x[bsize:]
+        return x[:bsize], stats
 
     @torch.no_grad()
     def act(self, ctx: Context, noise: Tensor, use_residual: bool = True, use_edit: bool = True,
             with_base: bool = False) -> dict:
         """Executed chunk [B, n_exec, A] (normalized, clipped), plus diagnostics and the same-noise base chunk."""
         use_residual = use_residual and self.cfg.qam.inv_temp > 0  # QAM: inv_temp == 0 samples the base only
-        x0, stats = self.sample_chunk(ctx, noise, use_residual)
+        x0, stats = self.sample_chunk(ctx, noise, use_residual, with_base=with_base and use_residual)
         a = self.clip(self.exec_slice(x0))
         out = {"latent": stats["latent"], "ratio": stats.get("ratio"), "sat": stats.get("sat"), "edit": None}
         if use_edit and self.edit is not None:
@@ -144,9 +153,8 @@ class QAMEAgent(nn.Module):
             a = self.clip(a + out["edit"])
         out["a_exec"] = a
         out["q"] = self.pessimistic_q(ctx, a)
-        if with_base:
-            out["a_base"] = a if not use_residual and out["edit"] is None else \
-                self.clip(self.exec_slice(self.sample_chunk(ctx, noise, False)[0]))
+        if with_base:  # without the residual, x0 is already the base chunk
+            out["a_base"] = self.clip(self.exec_slice(stats.get("x_base", x0)))
         return out
 
     # ---------------------------------------------------------------- losses
