@@ -114,6 +114,7 @@ logging:
     mode: online              # online | offline (sync later with `wandb sync`) | disabled
     project: residual-qam-e
     entity: null
+    name: null                # run name in wandb; null = the run dir name (timestamp)
     group: ${env.perturbation}
     tags: []
     log_videos: true

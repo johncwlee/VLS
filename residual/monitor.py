@@ -64,7 +64,7 @@ class Monitor:
         run_id = id_file.read_text().strip() if id_file.exists() else uuid.uuid4().hex[:8]
         id_file.write_text(run_id)
         self.wandb = wandb.init(project=wcfg.project, entity=wcfg.entity, group=wcfg.group, tags=list(wcfg.tags),
-                                mode=wcfg.mode, dir=str(run_dir), id=run_id, resume="allow", name=run_dir.name,
+                                mode=wcfg.mode, dir=str(run_dir), id=run_id, resume="allow", name=wcfg.name or run_dir.name,
                                 config=OmegaConf.to_container(cfg, resolve=True))
         for prefix, axis in AXES.items():
             wandb.define_metric(axis)
