@@ -1,12 +1,17 @@
-"""Train the π0.5 velocity residual with QAM-E on LIBERO-PRO: spec Stages 1-3, no agent yet.
+"""Train a residual on frozen π0.5 on LIBERO-PRO (spec Stages 1-3, no agent yet), or evaluate one (mode=eval).
 
+Baseline: plain π0.5 on seeded eval items (task, init set, init id); every later evaluation is paired with it.
 Stage 1: π0.5-only rollouts on seeded train inits -> protected pool (some episodes held out for the gate).
-Stage 2: offline QAM-E updates on the protected pool; gate = critic Q vs realized return-to-go on held-out episodes.
-Stage 3: rounds of [collect with π0.5 + residual + edit -> online pool; 50:50 updates; eval on official inits].
-Run from the repo root: ./run_residual.sh [overrides]; resume with ./run_residual.sh train.resume_dir=<run dir>.
-Multi-GPU (./run_residual.sh -g N, torchrun): one rank per GPU, each with its own π0.5 and envs. Collection runs in
-waves of one episode per rank, eval splits the episodes over ranks, and updates split the batch over ranks with
-averaged gradients. Rank 0 owns the buffer writes, logging and checkpoints.
+Stage 2: offline updates on the protected pool (critic only in action_residual mode); critic features are standardized
+  with the pool's statistics first. Gate = critic Q vs realized return-to-go on held-out episodes.
+Stage 3: rounds of [collect into the online pool; 50:50 updates; gate; paired eval every eval.every_rounds].
+  action_residual: collection adds exploration noise. The actor stays at zero (critic warm-up) until the held-out
+  same-state Q difference reaches actor.gate_q_diff; the run stops after actor.max_warmup_rounds if it never does.
+  qam_velocity: collection and updates as QAM-E (velocity residual + edit).
+Run from the repo root: scripts/run/run_residual.sh [overrides]; resume with train.resume_dir=<run dir>.
+Multi-GPU (-g N, torchrun): one rank per GPU, each with its own π0.5 and envs. Collection runs in waves of one
+episode per rank, eval splits the episodes over ranks, and each rank trains on train.batch_size rows of an
+N x batch_size update with averaged gradients. Rank 0 owns the buffer writes, logging, checkpoints and decisions.
 """
 
 import json
@@ -19,6 +24,7 @@ import socket
 import subprocess
 import time
 import traceback
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import timedelta
@@ -32,7 +38,7 @@ from hydra.core.hydra_config import HydraConfig
 from lerobot.utils.random_utils import set_seed
 
 from residual.buffer import ReplayBuffer, chunk_reward, field_specs
-from residual.monitor import Monitor, Timer, save_video
+from residual.monitor import Monitor, Timer, paired_stats, save_video
 from residual.pi05 import Pi05
 from residual.qam_e import Context, QAMEAgent
 from residual.rollout import LABEL_SOURCE, VLS_ROOT, EnvPool, run_episode, task_specs
@@ -42,6 +48,20 @@ MAX_CONSECUTIVE_ENV_ERRORS = 5
 VIDEO_FPS = 20
 # Ranks wait for each other's longest episode / eval share, and for rank 0's gate and checkpoint I/O.
 DIST_TIMEOUT = timedelta(hours=2)
+INIT_SETS = ("official", "train")  # position = the init-set id in eval seeds
+STORED_CTX_KEYS = ["h_prefix", "state_norm", "task", "step", "a_base"]  # critic/actor inputs without a π0.5 pass
+PROGRESS_EVERY_EPISODES = 10
+
+
+def eval_key(task: "Task", init_set: str, init_id: int, seed: int) -> str:
+    """Identifies an eval episode across runs and task subsets (paired evaluation)."""
+    return f"{task.suite}/t{task.task_id}/{init_set}/{init_id}/s{seed}"
+
+
+def eval_seed(seed: int, task: "Task", init_set: str, init_id: int) -> int:
+    """Episode seed from stable ids (suite name, LIBERO task id), never from Python's hash() or the run's task order."""
+    ids = [seed, zlib.crc32(task.suite.encode()), task.task_id, INIT_SETS.index(init_set), init_id]
+    return int(np.random.SeedSequence(ids).generate_state(1)[0])
 
 
 @dataclass(eq=False)  # identity hash: tasks key per-task dicts
@@ -70,8 +90,11 @@ class Trainer:
     def __init__(self, cfg, run_dir: Path, monitor: Monitor | None):
         self.cfg, self.run_dir, self.monitor = cfg, run_dir, monitor  # monitor: rank 0 only
         self.rank, self.world = (dist.get_rank(), dist.get_world_size()) if dist.is_initialized() else (0, 1)
-        if cfg.train.batch_size % self.world:
-            raise SystemExit(f"train.batch_size={cfg.train.batch_size} must split evenly over {self.world} GPUs")
+        unknown = set(cfg.eval.init_sets) - set(INIT_SETS)
+        if unknown:
+            raise SystemExit(f"eval.init_sets: unknown {sorted(unknown)}; expected a subset of {list(INIT_SETS)}")
+        if cfg.mode not in ("train", "eval"):
+            raise SystemExit(f"mode={cfg.mode!r}; expected train or eval")
         self.cpu_group = dist.new_group(backend="gloo", timeout=DIST_TIMEOUT) if self.world > 1 else None
         self.pi05 = Pi05(cfg.policy.pretrained_path, cfg.device)
         self.dims = self.pi05.dims(cfg.policy.exec_horizon, cfg.policy.num_inference_steps)
@@ -82,16 +105,23 @@ class Trainer:
                                self.pi05.action_high).to(cfg.device)
         self.timer = Timer()
         self.agent.timer = self.timer
+        # baseline: {eval_key: success} of plain π0.5; actor_on: action_residual warm-up passed
+        self.state = {"stage": 1, "round": 0, "update_step": 0, "best_eval": -1.0, "baseline": {},
+                      "actor_on": False, "warmup_eval_done": False}
         if cfg.policy.residual_ckpt:
-            self.agent.load_state_dict(torch.load(cfg.policy.residual_ckpt, weights_only=True)["agent"])
+            payload = torch.load(cfg.policy.residual_ckpt, weights_only=True)
+            self.agent.load_state_dict(payload["agent"])
+            self.state["baseline"].update(payload["state"].get("baseline", {}))
         libero_env = self.adapter(self.tasks[0])._env[0]
         specs = field_specs((3, libero_env.observation_height, libero_env.observation_width), self.dims)
+        capacity = 1 if cfg.mode == "eval" else cfg.train.buffer_capacity  # eval collects nothing
         if self.rank == 0:
-            self.buffer = ReplayBuffer(run_dir / "buffer", cfg.train.buffer_capacity, specs)
+            self.buffer = ReplayBuffer(run_dir / "buffer", capacity, specs)
         self._barrier()
         if self.rank > 0:
-            self.buffer = ReplayBuffer(run_dir / "buffer", cfg.train.buffer_capacity, specs, readonly=True)
-        self.state = {"stage": 1, "round": 0, "update_step": 0, "baseline_done": False, "best_eval": -1.0}
+            self.buffer = ReplayBuffer(run_dir / "buffer", capacity, specs, readonly=True)
+        self.eval_summary_path = run_dir / "eval_summary.json"
+        self.round_walls: list[float] = []
         self.rng = np.random.default_rng(cfg.seed)
         if (run_dir / "last.pt").exists():
             self._load(run_dir / "last.pt", full=True)
@@ -121,6 +151,10 @@ class Trainer:
 
     def adapter(self, task: Task):
         return self.envs.get(task.suite, task.task_id)
+
+    @property
+    def action_mode(self) -> bool:
+        return self.agent.actor is not None
 
     # ---------------------------------------------------------------- multi-GPU (no-ops on one GPU)
     def _barrier(self) -> None:
@@ -159,7 +193,7 @@ class Trainer:
         self.agent.load_state_dict(payload["agent"])
         self.agent.load_optim_state_dict(payload["optim"])
         if full:
-            self.state = payload["state"]
+            self.state.update(payload["state"])  # keys added since the checkpoint keep their defaults
             self.rng.bit_generator.state = payload["rng"]["numpy"]
             random.setstate(payload["rng"]["python"])
             torch.set_rng_state(payload["rng"]["torch"])
@@ -173,7 +207,7 @@ class Trainer:
 
     def axes(self, **extra) -> dict:
         return {"update_step": self.state["update_step"], "env_step": self.env_step, "round": self.state["round"],
-                "stage": self.state["stage"], **extra}
+                "stage": self.state["stage"], "chunks": self.buffer.size, **extra}
 
     # ---------------------------------------------------------------- rollouts
     def reward(self, rows: dict, t_max) -> tuple[np.ndarray, np.ndarray]:
@@ -199,24 +233,28 @@ class Trainer:
         return plan
 
     def collect(self, plan: list[Task], *, stage: int, rnd: int, online: bool, use_residual: bool,
-                use_edit: bool) -> None:
+                use_edit: bool, explore_std: torch.Tensor | None = None) -> None:
         """Waves of one episode per rank. Rank r of a wave fills buffer slot len(episodes) + r with plan[done + r],
         so slots, RNG keys and plan entries line up the same for any number of GPUs."""
         for done in range(0, len(plan), self.world):
             slot, mine = len(self.buffer.episodes) + self.rank, None
             if done + self.rank < len(plan):
                 mine = self._collect_episode(plan[done + self.rank], slot, online=online, use_residual=use_residual,
-                                             use_edit=use_edit)
+                                             use_edit=use_edit, explore_std=explore_std)
             results = self._gather(mine)
             if self.rank == 0:
                 for result in results:
                     if result is not None:
                         self._record_episode(result, stage=stage, rnd=rnd, online=online)
+                n = min(done + self.world, len(plan))
+                if n % PROGRESS_EVERY_EPISODES < self.world or n == len(plan):
+                    log.info(f"Collect stage {stage} round {rnd}: {n}/{len(plan)} episodes, {self.buffer.size} chunks")
             self._barrier()
             if self.rank > 0:
                 self.buffer.reload()
 
-    def _collect_episode(self, task: Task, slot: int, *, online: bool, use_residual: bool, use_edit: bool) -> dict:
+    def _collect_episode(self, task: Task, slot: int, *, online: bool, use_residual: bool, use_edit: bool,
+                         explore_std: torch.Tensor | None) -> dict:
         cfg, errors = self.cfg, []
         while True:
             # Per-episode RNG keyed on the buffer slot: a resumed run continues the sequence instead of replaying
@@ -228,7 +266,8 @@ class Trainer:
             try:
                 ep = run_episode(self.adapter(task), self.pi05, self.agent, task_idx=task.index,
                                  init_state=task.train_inits[init_id], t_max=task.t_max, use_residual=use_residual,
-                                 use_edit=use_edit, record_video=slot % cfg.logging.video_train_every_episodes == 0)
+                                 use_edit=use_edit, record_video=slot % cfg.logging.video_train_every_episodes == 0,
+                                 explore_std=explore_std)
             except Exception:  # an env failure drops this episode, not the run
                 errors.append({"suite": task.suite, "task": task.task_id, "init_id": init_id,
                                "error": traceback.format_exc()})
@@ -242,7 +281,7 @@ class Trainer:
                                    f"{'success' if ep.success else 'fail'}", ep.frames, VIDEO_FPS)
                 ep.frames = None
             return {"task": task.index, "init_id": init_id, "ep": ep, "video": video, "errors": errors,
-                    "heldout": (not online) and episode_rng.random() < cfg.offline.heldout_frac,
+                    "heldout": episode_rng.random() < (cfg.online if online else cfg.offline).heldout_frac,
                     "return": float(self.returns_to_go(ep.chunks, task.t_max)[0]),
                     "wall": time.perf_counter() - start}
 
@@ -262,25 +301,47 @@ class Trainer:
         if result["video"] is not None:
             self.monitor.video(result["video"], **self.axes())
 
-    def evaluate(self, *, use_residual: bool, use_edit: bool, tag: str, episodes_per_task: int) -> float:
-        """Official LIBERO-PRO init states, split over ranks; these episodes never enter the buffer."""
-        cfg = self.cfg
-        items = [(task, i) for task in self.tasks for i in range(episodes_per_task)]
-        mine = [self._eval_episode(task, i, use_residual=use_residual, use_edit=use_edit, tag=tag)
-                for task, i in items[self.rank::self.world]]
-        gathered = self._gather(mine)
-        if self.rank > 0:
-            return self._broadcast(None)
-        results = sorted((r for rank_results in gathered for r in rank_results), key=lambda r: (r["task"], r["i"]))
-        rows, successes, qs, rtgs, stats = [], defaultdict(list), [], [], defaultdict(list)
+    # ---------------------------------------------------------------- evaluation
+    def eval_items(self, init_set: str, per_task: int) -> list[tuple[int, str, int]]:
+        """(task index, init set, init id) for the first per_task inits of every task."""
+        items = []
+        for task in self.tasks:
+            n = len(task.official_inits if init_set == "official" else task.train_inits)
+            items += [(task.index, init_set, i) for i in range(min(per_task, n))]
+        return items
+
+    @staticmethod
+    def _tag(name: str, init_set: str) -> str:
+        return name if init_set == "official" else f"{name}_{init_set}"
+
+    def evaluate(self, items: list[tuple[int, str, int]], *, tag: str, use_residual: bool, use_edit: bool = True,
+                 explore_std: torch.Tensor | None = None) -> dict[str, bool]:
+        """Seeded episodes on (task index, init set, init id) items, split over ranks; never added to the buffer.
+        Returns {eval_key: success} on every rank (episodes that raised are left out)."""
+        items = self._broadcast(items)
+        mine, results = items[self.rank::self.world], []
+        for k, (task_index, init_set, init_id) in enumerate(mine, 1):
+            results.append(self._eval_episode(self.tasks[task_index], init_set, init_id, tag=tag,
+                                              use_residual=use_residual, use_edit=use_edit, explore_std=explore_std))
+            if self.rank == 0 and (k % PROGRESS_EVERY_EPISODES == 0 or k == len(mine)):
+                log.info(f"Eval [{tag}]: {k}/{len(mine)} episodes on rank 0 ({len(items)} over {self.world} GPU(s))")
+        gathered = self._gather(results)
+        outcomes = self._log_eval(tag, [r for rank_results in gathered for r in rank_results]) if self.rank == 0 else None
+        return self._broadcast(outcomes)
+
+    def _log_eval(self, tag: str, results: list[dict]) -> dict[str, bool]:
+        """Rank 0: success per task / suite, episode stats, Q vs return, the per-init table; returns the outcomes."""
+        results = sorted(results, key=lambda r: (r["task"], r["init_set"], r["init_id"]))
+        rows, successes, qs, rtgs, stats, outcomes = [], defaultdict(list), [], [], defaultdict(list), {}
         for r in results:
             task = self.tasks[r["task"]]  # by index: Task hashes by identity and results may be unpickled copies
             if r["ep"] is None:
-                rows.append([task.suite, task.task_id, r["init_id"], "error", 0])
+                rows.append([task.suite, task.task_id, r["init_set"], r["init_id"], "error", 0])
                 continue
             ep = r["ep"]
+            outcomes[r["key"]] = ep.success
             successes[task].append(ep.success)
-            rows.append([task.suite, task.task_id, r["init_id"], ep.success, ep.steps])
+            rows.append([task.suite, task.task_id, r["init_set"], r["init_id"], ep.success, ep.steps])
             qs += ep.q
             rtgs += r["rtg"]
             for k, v in ep.stats.items():
@@ -291,36 +352,89 @@ class Trainer:
         overall = float(np.mean([s for v in successes.values() for s in v])) if successes else 0.0
         metrics = {f"eval/{tag}/success": overall}
         by_suite = defaultdict(list)
-        for task, outcomes in successes.items():
-            metrics[f"eval/{tag}/success_{task.label}"] = float(np.mean(outcomes))
-            by_suite[task.suite] += outcomes
+        for task, task_successes in successes.items():
+            metrics[f"eval/{tag}/success_{task.label}"] = float(np.mean(task_successes))
+            by_suite[task.suite] += task_successes
         metrics.update({f"eval/{tag}/success_{suite}": float(np.mean(v)) for suite, v in by_suite.items()})
         metrics.update({f"eval/{tag}/{k}": float(np.mean(v)) for k, v in stats.items()})
         metrics.update(self._q_vs_return(np.array(qs), np.array(rtgs), f"eval/{tag}"))
         self.monitor.log(metrics, **self.axes())
-        self.monitor.table(f"{tag}_by_init", ["suite", "task", "init_id", "success", "steps"], rows, **self.axes())
+        self.monitor.table(f"{tag}_by_init", ["suite", "task", "init_set", "init_id", "success", "steps"], rows,
+                           **self.axes())
         per_suite = {suite: round(float(np.mean(v)), 3) for suite, v in by_suite.items()}
-        log.info(f"Eval [{tag}] round {self.state['round']} ({episodes_per_task} per task): success {overall:.3f} "
+        log.info(f"Eval [{tag}] round {self.state['round']} ({len(results)} episodes): success {overall:.3f} "
                  f"per suite {per_suite} per task {[(t.label, round(float(np.mean(v)), 2)) for t, v in successes.items()]}")
-        return self._broadcast(overall)
+        return outcomes
 
-    def _eval_episode(self, task: Task, i: int, *, use_residual: bool, use_edit: bool, tag: str) -> dict:
-        init_id = i % len(task.official_inits)
-        result = {"task": task.index, "i": i, "init_id": init_id, "ep": None, "rtg": [], "video": None}
+    def _eval_episode(self, task: Task, init_set: str, init_id: int, *, tag: str, use_residual: bool, use_edit: bool,
+                      explore_std: torch.Tensor | None) -> dict:
+        inits = task.official_inits if init_set == "official" else task.train_inits
+        seed = self.cfg.eval.seed
+        result = {"task": task.index, "init_set": init_set, "init_id": init_id, "ep": None, "rtg": [], "video": None,
+                  "key": eval_key(task, init_set, init_id, seed)}
         try:
             ep = run_episode(self.adapter(task), self.pi05, self.agent, task_idx=task.index,
-                             init_state=task.official_inits[init_id], t_max=task.t_max, use_residual=use_residual,
-                             use_edit=use_edit, record_video=i < self.cfg.logging.video_eval_per_task)
+                             init_state=inits[init_id], t_max=task.t_max, use_residual=use_residual,
+                             use_edit=use_edit, record_video=init_id < self.cfg.logging.video_eval_per_task,
+                             seed=eval_seed(seed, task, init_set, init_id), explore_std=explore_std)
         except Exception:
-            log.exception(f"Eval episode failed ({task.label}, official init {init_id}); excluded")
+            log.exception(f"Eval episode failed ({task.label}, {init_set} init {init_id}); excluded")
             return result
         if ep.frames:
-            result["video"] = save_video(self.run_dir, f"eval_{tag}_r{self.state['round']}_{task.label}_i{init_id}_"
-                                         f"{'success' if ep.success else 'fail'}", ep.frames, VIDEO_FPS)
+            result["video"] = save_video(self.run_dir, f"eval_{tag}_r{self.state['round']}_{task.label}_{init_set}"
+                                         f"{init_id}_{'success' if ep.success else 'fail'}", ep.frames, VIDEO_FPS)
         result["rtg"] = self.returns_to_go(ep.chunks, task.t_max).tolist()
         ep.chunks, ep.frames = None, None  # only the summary goes back to rank 0
         result["ep"] = ep
         return result
+
+    def _ensure_baseline(self, per_task: int) -> None:
+        """Plain π0.5 on every eval item without a stored outcome (for this eval.seed). The outcomes live in the
+        checkpoint state, so every later policy evaluation, in this run or a mode=eval run, is paired with them."""
+        for init_set in self.cfg.eval.init_sets:
+            items = [it for it in self.eval_items(init_set, per_task)
+                     if eval_key(self.tasks[it[0]], it[1], it[2], self.cfg.eval.seed) not in self.state["baseline"]]
+            if items:
+                self.state["baseline"].update(self.evaluate(items, tag=self._tag("baseline", init_set),
+                                                            use_residual=False, use_edit=False))
+                self._save("last.pt")  # per set: a crash or job timeout keeps the finished sets
+
+    def _evaluate_policy(self, per_task: int) -> float:
+        """The current policy on every init set, paired with the baseline; returns success on the official set."""
+        success = None
+        for init_set in self.cfg.eval.init_sets:
+            tag = self._tag("policy", init_set)
+            outcomes = self.evaluate(self.eval_items(init_set, per_task), tag=tag, use_residual=True)
+            self._paired_report(tag, outcomes)
+            if init_set == "official" or success is None:
+                success = float(np.mean(list(outcomes.values()))) if outcomes else 0.0
+        return success
+
+    def _paired_report(self, tag: str, outcomes: dict[str, bool]) -> None:
+        """Rank 0: paired difference from the baseline, overall and per task -> metrics and eval_summary.json."""
+        if self.rank > 0:
+            return
+        overall = paired_stats(outcomes, self.state["baseline"])
+        if not overall:
+            log.warning(f"Eval [{tag}]: no baseline outcome to pair with (eval.baseline_at_start=false?)")
+            return
+        by_task = defaultdict(dict)
+        for key, success in outcomes.items():
+            suite, task_id = key.split("/")[:2]
+            by_task[f"{suite}_{task_id}"][key] = success
+        per_task = {label: paired_stats(o, self.state["baseline"]) for label, o in sorted(by_task.items())}
+        metrics = {f"eval/{tag}/{k}": v for k, v in overall.items() if k != "success"}  # success: _log_eval
+        metrics.update({f"eval/{tag}/{k}_{label}": v for label, s in per_task.items() for k, v in s.items()
+                        if k in ("paired_diff", "paired_se")})
+        self.monitor.log(metrics, **self.axes())
+        log.info(f"Eval [{tag}] vs baseline over {overall['paired_n']} paired episodes: success "
+                 f"{overall['success']:.3f} vs {overall['baseline_success']:.3f}, diff {overall['paired_diff']:+.3f} "
+                 f"± {overall['paired_se']:.3f} (SE), flipped {overall['flip_frac']:.3f}")
+        summary = json.loads(self.eval_summary_path.read_text()) if self.eval_summary_path.exists() else {}
+        summary[f"{tag}_round{self.state['round']}"] = {**overall, "per_task": per_task}
+        tmp = self.eval_summary_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(summary, indent=2))
+        os.replace(tmp, self.eval_summary_path)
 
     @staticmethod
     def _q_vs_return(q: np.ndarray, rtg: np.ndarray, prefix: str) -> dict:
@@ -328,33 +442,75 @@ class Trainer:
             return {}
         return {f"{prefix}/q_return_corr": float(np.corrcoef(q, rtg)[0, 1]), f"{prefix}/q_bias": float((q - rtg).mean())}
 
-    @torch.no_grad()
-    def gate(self) -> None:
-        """Spec §10 Stage 2 gate: critic Q of held-out offline chunks vs their realized return-to-go."""
-        if self.rank > 0:
-            return
-        episodes = [ep for ep in self.buffer.episodes if ep["heldout"]]
+    def _heldout(self, online: bool) -> tuple[dict, np.ndarray, list[dict], np.ndarray] | None:
+        """Every chunk of the held-out offline or online episodes: (rows, return-to-go, episodes, episode starts)."""
+        episodes = [ep for ep in self.buffer.episodes if ep["heldout"] and ep["online"] == online]
         if not episodes:
-            return
-        qs, rtgs, q_success, q_fail = [], [], [], []
-        for ep in episodes:
-            rows = np.arange(ep["start"], ep["start"] + ep["length"])
-            data = self.buffer.get(rows, ["h_prefix", "state_norm", "step", "task", "a_exec", "steered", "terminal",
-                                          "success"])
-            t_max = int(self.t_max_by_task[data["task"][0]])
-            ctx = Context(h_prefix=torch.from_numpy(data["h_prefix"]).float().to(self.cfg.device),
-                          state=torch.from_numpy(data["state_norm"]).to(self.cfg.device),
-                          progress=torch.from_numpy(data["step"] / t_max).float().to(self.cfg.device), base=None)
-            q = self.agent.pessimistic_q(ctx, torch.from_numpy(data["a_exec"]).to(self.cfg.device)).cpu().numpy()
-            qs += q.tolist()
-            rtgs += self.returns_to_go(data, t_max).tolist()
-            (q_success if ep["success"] else q_fail).append(q[0])
-        metrics = self._q_vs_return(np.array(qs), np.array(rtgs), "gate")
-        metrics.update({"gate/q0_success_episodes": float(np.mean(q_success)) if q_success else float("nan"),
-                        "gate/q0_failed_episodes": float(np.mean(q_fail)) if q_fail else float("nan")})
-        self.monitor.log(metrics, **self.axes())
+            return None
+        rows = np.concatenate([np.arange(ep["start"], ep["start"] + ep["length"]) for ep in episodes])
+        data = self.buffer.get(rows, STORED_CTX_KEYS + ["a_exec", "steered", "terminal", "success"])
+        starts = np.cumsum([0] + [ep["length"] for ep in episodes])[:-1]
+        rtg = np.concatenate([
+            self.returns_to_go({k: data[k][a:a + ep["length"]] for k in ("steered", "terminal", "success")},
+                               int(self.t_max_by_task[data["task"][a]]))
+            for a, ep in zip(starts, episodes, strict=True)])
+        return data, rtg, episodes, starts
+
+    @torch.no_grad()
+    def gate(self) -> dict | None:
+        """Rank 0; returns the logged metrics (None on other ranks).
+        Spec §10 Stage 2 gate on held-out offline episodes: critic Q vs realized return-to-go. It passes a critic that
+        ignores actions, so the action gate on held-out online episodes (collected with exploration noise) asks
+        whether Q changes with the executed action: agent.action_metrics."""
+        if self.rank > 0:
+            return None
+        metrics, device = {}, self.cfg.device
+        # ponytail: whole held-out set in one batch (~10k rows max); chunk it if the gate runs out of GPU memory
+        offline = self._heldout(online=False)
+        if offline is not None:
+            data, rtg, episodes, starts = offline
+            q = self.agent.pessimistic_q(self._stored_context(data),
+                                         torch.from_numpy(data["a_exec"]).to(device)).cpu().numpy()
+            metrics.update(self._q_vs_return(q, rtg, "gate"))
+            q0 = {True: [], False: []}
+            for a, ep in zip(starts, episodes, strict=True):
+                q0[ep["success"]].append(q[a])
+            metrics.update({"gate/q0_success_episodes": float(np.mean(q0[True])) if q0[True] else float("nan"),
+                            "gate/q0_failed_episodes": float(np.mean(q0[False])) if q0[False] else float("nan")})
+        online = self._heldout(online=True)
+        if online is not None:
+            data, rtg = online[:2]
+            action = self.agent.action_metrics(self._stored_context(data), torch.from_numpy(data["a_exec"]).to(device),
+                                               torch.from_numpy(rtg).to(device))
+            metrics.update({k: float(v) for k, v in action.items()})
+        if metrics:
+            self.monitor.log(metrics, **self.axes())
+        return metrics
 
     # ---------------------------------------------------------------- updates
+    def _stored_context(self, rows: dict) -> Context:
+        """Critic / actor inputs from stored buffer fields, without a π0.5 pass (a_base only if it was read)."""
+        device = self.cfg.device
+        return Context(h_prefix=torch.from_numpy(rows["h_prefix"]).float().to(device),
+                       state=torch.from_numpy(rows["state_norm"]).to(device),
+                       progress=torch.from_numpy(rows["step"] / self.t_max_by_task[rows["task"]]).float().to(device),
+                       base=None, a_base=torch.from_numpy(rows["a_base"]).to(device) if "a_base" in rows else None)
+
+    def _fit_feat_stats(self) -> None:
+        """Standardize critic / actor features with the offline pool's statistics; rank 0 computes, all ranks get
+        the same values."""
+        if self.rank == 0:
+            idx = self.buffer.protected_idx
+            if len(idx):
+                rows = self.buffer.get(idx, ["h_prefix", "state_norm", "task", "step"])
+                self.agent.fit_feat_stats(self.agent.raw_feat(self._stored_context(rows)))
+                log.info(f"Critic features standardized with {len(idx)} offline chunks")
+            else:
+                log.warning("No offline chunks: critic features stay unstandardized")
+        if self.world > 1:
+            for t in (self.agent.feat_mean, self.agent.feat_std):
+                dist.broadcast(t, src=0)
+
     def _context(self, rows: dict) -> Context:
         tasks = [self.tasks[i].text for i in rows["task"]]
         batch = self.pi05.preprocess(rows["image"], rows["image2"], rows["state"], tasks)
@@ -362,27 +518,32 @@ class Trainer:
 
     def train(self, n_updates: int, offline_ratio: float, stage_ckpt: bool) -> None:
         cfg, device = self.cfg, self.cfg.device
-        obs_keys = ["image", "image2", "state", "task", "step"]
+        # action_residual: stored features and π0.5's chunk a_base, no π0.5 pass; qam_velocity re-encodes images
+        stored = self.action_mode
+        obs_keys = STORED_CTX_KEYS if stored else ["image", "image2", "state", "task", "step"]
         window = defaultdict(list)
         # strided: sample() puts protected rows before online ones, so a contiguous share would give rank 0
         # (which logs batch metrics) only offline data
         mine = slice(self.rank, None, self.world)
         for _ in range(n_updates):
             idx = next_idx = None
-            if self.rank == 0:
-                idx = self.buffer.sample(cfg.train.batch_size, offline_ratio, self.rng)
+            if self.rank == 0:  # train.batch_size is per GPU
+                idx = self.buffer.sample(cfg.train.batch_size * self.world, offline_ratio, self.rng)
                 next_idx = self.buffer.next_index(idx)
             idx, next_idx = self._broadcast((idx, next_idx))
             with self.timer("sample"):
                 rows = self.buffer.get(idx[mine], obs_keys + ["a_exec", "steered", "terminal", "success"])
                 next_rows = self.buffer.get(next_idx[mine], obs_keys)
-            with self.timer("prefix_encode"):
-                ctx, next_ctx = self._context(rows), self._context(next_rows)
+            if stored:
+                ctx, next_ctx = self._stored_context(rows), self._stored_context(next_rows)
+            else:
+                with self.timer("prefix_encode"):
+                    ctx, next_ctx = self._context(rows), self._context(next_rows)
             reward, mask = self.reward(rows, self.t_max_by_task[rows["task"]])
             with self.timer("total_agent"):
                 info, hist = self.agent.update(ctx, torch.from_numpy(rows["a_exec"]).to(device),
                                                torch.from_numpy(reward).to(device), torch.from_numpy(mask).to(device),
-                                               next_ctx)
+                                               next_ctx, actor=self.state["actor_on"])
             self.state["update_step"] += 1
             step = self.state["update_step"]
             if cfg.logging.nan_guard:
@@ -435,15 +596,16 @@ class Trainer:
 
     # ---------------------------------------------------------------- stages
     def run(self) -> None:
+        if self.cfg.mode == "eval":
+            self.run_eval()
+            return
         cfg, s = self.cfg, self.state
         if s["stage"] == 1:
-            if cfg.eval.baseline_at_start and not s["baseline_done"]:
-                self.evaluate(use_residual=False, use_edit=False, tag="baseline",
-                              episodes_per_task=cfg.eval.final_episodes_per_task)
-                s["baseline_done"] = True
-                self._save("last.pt")
+            if cfg.eval.baseline_at_start:
+                self._ensure_baseline(cfg.eval.final_episodes_per_task)
             plan = self.remaining([cfg.offline.episodes_per_task] * len(self.tasks), stage=1, rnd=0)
             self.collect(plan, stage=1, rnd=0, online=False, use_residual=False, use_edit=False)
+            self._fit_feat_stats()
             s["stage"] = 2
             self._save("last.pt")
         if s["stage"] == 2:
@@ -453,28 +615,70 @@ class Trainer:
             self._barrier()  # ranks > 0 load stage2.pt each round when reinit_each_round
             s["stage"] = 3
             self._save("last.pt")
-        while s["round"] < cfg.online.rounds:
-            rnd = s["round"] + 1
-            start = time.perf_counter()
-            if cfg.online.reinit_each_round:
-                self._load(self.run_dir / "stage2.pt", full=False)
-            self.collect(self.remaining(self._round_targets(rnd), stage=3, rnd=rnd), stage=3, rnd=rnd, online=True,
-                         use_residual=True, use_edit=True)
-            self.train(cfg.online.updates_per_round, cfg.online.offline_ratio, stage_ckpt=False)
-            s["round"] = rnd
-            self._log_round(rnd, time.perf_counter() - start)
-            self.gate()
-            final = rnd == cfg.online.rounds
-            if rnd % cfg.eval.every_rounds == 0 or final:
-                episodes = cfg.eval.final_episodes_per_task if final else cfg.eval.episodes_per_task
-                success = self.evaluate(use_residual=True, use_edit=True, tag="policy", episodes_per_task=episodes)
-                if success > s["best_eval"]:
-                    s["best_eval"] = success
-                    self._save("best.pt")
-            self._save("last.pt")
-        if cfg.online.rounds == 0:  # no online phase (e.g. eval-only with policy.residual_ckpt): evaluate once
-            self.evaluate(use_residual=True, use_edit=True, tag="policy",
-                          episodes_per_task=cfg.eval.final_episodes_per_task)
+        while s["round"] < cfg.online.rounds and self._round(s["round"] + 1):
+            pass
+
+    def _round(self, rnd: int) -> bool:
+        """One online round; False when the critic warm-up ran out of rounds (the run stops and can be resumed).
+        Every decision here depends only on state that is identical on all ranks (gate result broadcast)."""
+        cfg, s = self.cfg, self.state
+        warmup = self.action_mode and not s["actor_on"]
+        if warmup and rnd > cfg.actor.max_warmup_rounds:
+            log.warning(f"Stopping: the action gate did not pass in actor.max_warmup_rounds={cfg.actor.max_warmup_rounds}"
+                        f" rounds (needs gate/q_action_diff >= {cfg.actor.gate_q_diff}; see gate/* in metrics.jsonl). "
+                        f"Resume with a larger actor.max_warmup_rounds to keep warming up the critic.")
+            return False
+        start = time.perf_counter()
+        if cfg.online.reinit_each_round:
+            self._load(self.run_dir / "stage2.pt", full=False)
+        explore = self.agent.explore_std() if self.action_mode else None
+        self.collect(self.remaining(self._round_targets(rnd), stage=3, rnd=rnd), stage=3, rnd=rnd, online=True,
+                     use_residual=True, use_edit=True, explore_std=explore)
+        self.train(cfg.online.updates_per_round, cfg.online.offline_ratio, stage_ckpt=False)
+        s["round"] = rnd
+        gate = self._broadcast(self.gate())
+        if warmup:
+            self._warmup_decision(rnd, gate)
+        final = rnd == cfg.online.rounds
+        # While the actor is zero the policy is π0.5 itself: one eval (an in-process determinism check: it must
+        # match the baseline exactly) is enough.
+        if (rnd % cfg.eval.every_rounds == 0 or final) and not (warmup and s["warmup_eval_done"]):
+            s["warmup_eval_done"] |= warmup
+            success = self._evaluate_policy(cfg.eval.final_episodes_per_task if final else cfg.eval.episodes_per_task)
+            if success > s["best_eval"]:
+                s["best_eval"] = success
+                self._save("best.pt")
+        self._log_round(rnd, time.perf_counter() - start)
+        self._save("last.pt")
+        return True
+
+    def _warmup_decision(self, rnd: int, gate: dict | None) -> None:
+        """Every rank gets the same gate dict and flips together: the actor flag decides which parameters get
+        gradients, and the all-reduce must match across ranks."""
+        diff, threshold = (gate or {}).get("gate/q_action_diff"), self.cfg.actor.gate_q_diff
+        if diff is not None and diff >= threshold:
+            self.state["actor_on"] = True
+            log.info(f"Round {rnd}: action gate passed (gate/q_action_diff {diff:.4f} >= {threshold}); "
+                     f"actor updates start next round")
+        else:
+            log.info(f"Round {rnd}: critic warm-up, gate/q_action_diff {diff} < {threshold}"
+                     + ("" if diff is not None else " (no held-out online episode yet)"))
+
+    def run_eval(self) -> None:
+        """mode=eval: π0.5 baseline on items without a stored outcome, then policy.residual_ckpt and each
+        eval.explore_bounds entry (π0.5 + exploration noise at that s), each paired with the baseline."""
+        cfg, per_task = self.cfg, self.cfg.eval.final_episodes_per_task
+        if cfg.eval.explore_bounds and not self.action_mode:
+            raise SystemExit("eval.explore_bounds needs actor.mode=action_residual")
+        self._ensure_baseline(per_task)
+        if cfg.policy.residual_ckpt:
+            self._evaluate_policy(per_task)
+        for bound in cfg.eval.explore_bounds:
+            for init_set in cfg.eval.init_sets:
+                tag = self._tag(f"explore_s{round(bound * 100):03d}", init_set)  # no dots in wandb keys
+                outcomes = self.evaluate(self.eval_items(init_set, per_task), tag=tag, use_residual=False,
+                                         explore_std=self.agent.explore_std(bound))
+                self._paired_report(tag, outcomes)
 
     def _round_targets(self, rnd: int) -> list[int]:
         """Split online.episodes_per_round over the tasks; the remainder rotates so every task gets equal data."""
@@ -491,13 +695,21 @@ class Trainer:
         for suite in {t.suite for t in self.tasks}:
             outcomes = [ep["success"] for ep in this_round if ep["suite"] == suite]
             metrics[f"round/train_success_{suite}"] = float(np.mean(outcomes)) if outcomes else float("nan")
-        # A task whose every training episode so far failed gives QAM nothing to learn (identical returns).
+        # A task whose every training episode so far failed gives nothing to learn (identical returns).
         succeeded = {(ep["suite"], ep["task"]) for ep in self.buffer.episodes if ep["success"]}
         never = [t.label for t in self.tasks if (t.suite, t.task_id) not in succeeded]
         metrics["round/never_succeeded_tasks"] = len(never)
         if never:
             log.warning(f"Round {rnd}: {len(never)}/{len(self.tasks)} tasks have no successful training episode yet, "
-                        f"so QAM has nothing to learn from them: {never}")
+                        f"so there is nothing to learn from them: {never}")
+        self.round_walls.append(wall)
+        rounds = self.cfg.online.rounds
+        eta = float(np.mean(self.round_walls)) * (rounds - rnd) / 3600
+        actor = "-" if not self.action_mode else "on" if self.state["actor_on"] else "off (warm-up)"
+        metrics.update({"progress/chunks": self.buffer.size, "progress/frac": rnd / rounds,
+                        "progress/eta_hours": eta, "progress/actor_on": float(self.state["actor_on"])})
+        log.info(f"Round {rnd}/{rounds} | {self.buffer.size} chunks | actor {actor} | train success "
+                 f"{metrics['round/train_success']:.3f} | round {wall / 60:.1f} min | ETA {eta:.1f} h")
         self.monitor.log(metrics, **self.axes())
 
 
@@ -526,15 +738,18 @@ def main(cfg) -> None:
     set_seed(cfg.seed)
     monitor = None
     if rank == 0:
+        gpus = dist.get_world_size() if dist.is_initialized() else 1
+        run_facts = {"gpus": gpus, "effective_batch_size": cfg.train.batch_size * gpus}
+        log.info(f"Run dir: {run_dir} | mode {cfg.mode} | actor.mode {cfg.actor.mode} | batch {cfg.train.batch_size} "
+                 f"per GPU x {gpus} GPU(s) = {run_facts['effective_batch_size']} per update")
         meta_path = run_dir / "meta.json"
         starts = json.loads(meta_path.read_text()) if meta_path.exists() else []
         starts.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "host": socket.gethostname(),
-                       "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
-                       "gpus": dist.get_world_size() if dist.is_initialized() else 1,
+                       "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None, **run_facts,
                        "python": platform.python_version(), "vls": git_state(VLS_ROOT),
                        "root": git_state(VLS_ROOT.parents[1]), "overrides": list(HydraConfig.get().overrides.task)})
         meta_path.write_text(json.dumps(starts, indent=2))
-        monitor = Monitor(cfg, run_dir)
+        monitor = Monitor(cfg, run_dir, extra_config=run_facts)
     try:
         Trainer(cfg, run_dir, monitor).run()
     finally:

@@ -1,4 +1,5 @@
-"""Networks for the π0.5 velocity residual trained with QAM-E: residual MLP, critic ensemble, edit actor.
+"""Networks for the residual on frozen π0.5: velocity residual MLP and edit actor (QAM-E), action-space residual,
+critic ensemble.
 
 Layer conventions follow the QAM reference (modules/qam/utils/networks.py): Dense -> activation -> LayerNorm,
 xavier-uniform kernels, zero biases.
@@ -81,6 +82,33 @@ class CriticEnsemble(nn.Module):
     def forward(self, feat: Tensor, action: Tensor) -> Tensor:
         x = torch.cat([feat, action.flatten(1)], dim=-1)
         return torch.stack([m(x).squeeze(-1) for m in self.members])
+
+
+class ActionResidual(nn.Module):
+    """Deterministic bounded residual on the executed chunk: delta = bound * tanh(mlp(feat, a_base)), per action dim.
+    The output layer is zero-initialized, so delta == 0 and the policy is exactly π0.5 at the start. `bound` is saved
+    with the weights; loading weights trained with a different bound is refused rather than silently rescaled."""
+
+    def __init__(self, feat_dim: int, exec_horizon: int, bound: Tensor, cfg):
+        super().__init__()
+        exec_dim = exec_horizon * bound.numel()
+        self.trunk = mlp(feat_dim + exec_dim, cfg.hidden_dims, None, cfg.activation, layer_norm=False)
+        self.out = nn.Linear(cfg.hidden_dims[-1], exec_dim)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        self.register_buffer("bound", bound.float())  # [A]
+
+    def forward(self, feat: Tensor, a_base: Tensor) -> Tensor:
+        """feat [B, F], a_base [B, n_exec, A] -> delta with a_base's shape."""
+        raw = self.out(self.trunk(torch.cat([feat, a_base.flatten(1)], dim=-1))).view_as(a_base)
+        return self.bound * torch.tanh(raw)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        saved = state_dict.get(prefix + "bound")
+        if saved is not None and not torch.equal(saved.to(self.bound), self.bound):
+            raise ValueError(f"checkpoint actor bound {saved.tolist()} != config {self.bound.tolist()}; "
+                             f"set actor.bound / actor.gripper_bound to the values it was trained with")
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 
 class EditActor(nn.Module):

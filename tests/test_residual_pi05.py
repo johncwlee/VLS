@@ -18,12 +18,16 @@ def pi05():
     return Pi05(CKPT, "cuda")
 
 
-@pytest.fixture(scope="module")
-def agent(pi05):
+def make_agent(pi05, mode: str):
     from residual.qam_e import QAMEAgent
-    cfg = OmegaConf.load("residual/hyperparameters.yaml")
+    cfg = OmegaConf.merge(OmegaConf.load("residual/hyperparameters.yaml"), {"actor": {"mode": mode}})
     dims = pi05.dims(cfg.policy.exec_horizon, cfg.policy.num_inference_steps)
     return QAMEAgent(cfg, dims, pi05.velocity_and_hidden, pi05.action_low, pi05.action_high).cuda()
+
+
+@pytest.fixture(scope="module")
+def agent(pi05):
+    return make_agent(pi05, "qam_velocity")
 
 
 @pytest.fixture(scope="module")
@@ -52,6 +56,16 @@ def test_zero_residual_sampler_matches_stock_sample_actions(pi05, agent, batch):
     untrimmed = pi05.model.sample_actions(images, img_masks, batch[OBS_LANGUAGE_TOKENS],
                                           batch[OBS_LANGUAGE_ATTENTION_MASK], noise=noise.clone())
     torch.testing.assert_close(ours, untrimmed, atol=3e-2, rtol=0)
+
+
+def test_zero_action_residual_executes_stock_sample_actions(pi05, batch):
+    agent = make_agent(pi05, "action_residual")
+    ctx = pi05.context(batch, torch.zeros(2))
+    noise = noise_for(agent)
+    out = agent.act(ctx, noise, with_base=True)
+    stock = pi05.model.sample_actions(*pi05.prefix_inputs(batch), noise=noise.clone())
+    torch.testing.assert_close(out["a_exec"], agent.clip(agent.exec_slice(stock)), atol=1e-5, rtol=0)
+    assert torch.equal(out["a_exec"], out["a_base"])
 
 
 def test_base_rows_on_repeated_prefix_match_base_sample(pi05, agent, batch):

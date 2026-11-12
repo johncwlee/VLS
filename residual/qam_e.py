@@ -1,5 +1,14 @@
-"""QAM-E: Q-learning with Adjoint Matching plus an edit policy, for a velocity residual on a frozen flow policy.
+"""Residual RL on a frozen flow policy (π0.5), in one of two `actor.mode`s sharing the critic and the buffer.
 
+action_residual (default): a deterministic bounded correction delta = s * tanh(.) is added to π0.5's executed chunk
+and trained to maximize the critic (residual RL with the RLPD recipe: 50:50 batches, LayerNorm critic ensemble).
+Updates need no π0.5 pass: the buffer stores π0.5's chunk a_base for every observation, so the critic target uses
+clip(a_base' + delta(o', a_base')) and the actor loss uses the stored a_base.
+
+qam_velocity: QAM-E as run on 2026-11-10 (tag residual-qam-e-v1), described below. It cannot move a nearly
+deterministic base: the tilt it allows scales with π0.5's per-observation variance (~0.004).
+
+QAM-E: Q-learning with Adjoint Matching plus an edit policy, for a velocity residual on a frozen flow policy.
 PyTorch port of RL2-VLA/third_party/qam/agents/qam.py (same algorithm as modules/qam/agents/qam.py) in its
 `residual=True`, `edit_scale > 0` configuration: the frozen base flow (π0.5) is QAM's `actor_slow`, the
 residual v_phi is `actor_fast`, and the edit policy refines the executed chunk to maximize Q.
@@ -23,10 +32,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from residual.networks import CriticEnsemble, EditActor, ResidualMLP
+from residual.networks import ActionResidual, CriticEnsemble, EditActor, ResidualMLP
 
 # (base state, x [B, H, D], t [B]) -> (velocity [B, H, D], action-expert hidden [B, H, D_ae]), openpi convention
 BaseFn = Callable[[Any, Tensor, Tensor], tuple[Tensor, Tensor]]
+MODES = ("action_residual", "qam_velocity")
+FEAT_STD_FLOOR = 1e-3  # critic/actor feature standardization; the smallest h_prefix dim std measured is 0.056
 
 
 @dataclass
@@ -36,6 +47,7 @@ class Context:
     state: Tensor     # [B, S] normalized proprioception
     progress: Tensor  # [B] chunk index / max episode chunks
     base: Any
+    a_base: Tensor | None = None  # [B, n_exec, A] π0.5's executed chunk here (stored; action_residual updates)
 
 
 @dataclass(frozen=True)
@@ -68,25 +80,63 @@ class QAMEAgent(nn.Module):
         self.cfg, self.dims, self.base_fn = cfg, dims, base_fn
         self.register_buffer("action_low", action_low.float())  # env bounds in normalized action space
         self.register_buffer("action_high", action_high.float())
+        if cfg.actor.mode not in MODES:
+            raise ValueError(f"actor.mode={cfg.actor.mode!r}; expected one of {MODES}")
         exec_dim = dims.exec_horizon * dims.action_dim
         self.feat_dim = dims.prefix_dim + dims.state_dim + int(cfg.critic.time_feature)
-        self.residual = ResidualMLP(dims.horizon, dims.action_dim, dims.ae_dim, dims.prefix_dim, dims.state_dim,
-                                    cfg.residual)
+        # feature standardization, fitted once on the offline pool (fit_feat_stats); identity until then
+        self.register_buffer("feat_mean", torch.zeros(self.feat_dim))
+        self.register_buffer("feat_std", torch.ones(self.feat_dim))
         self.critic = CriticEnsemble(self.feat_dim + exec_dim, cfg.critic)
         self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
-        self.edit = EditActor(self.feat_dim, exec_dim, cfg.edit) if cfg.edit.scale > 0 else None
-        self.target_entropy = -cfg.edit.target_entropy_multiplier * exec_dim
-        groups = {"residual": self.residual.parameters(), "critic": self.critic.parameters()}
-        if self.edit is not None:
-            groups["edit"] = [p for n, p in self.edit.named_parameters() if n != "log_alpha"]
-            groups["alpha"] = [self.edit.log_alpha]
+        self.residual = self.edit = self.actor = None
+        groups = {"critic": self.critic.parameters()}
+        if cfg.actor.mode == "action_residual":
+            if cfg.actor.bound <= 0:
+                raise ValueError(f"actor.bound must be > 0, got {cfg.actor.bound}")
+            self.actor = ActionResidual(self.feat_dim, dims.exec_horizon, self.bound_vector(), cfg.actor)
+            groups["actor"] = self.actor.parameters()
+        else:
+            self.residual = ResidualMLP(dims.horizon, dims.action_dim, dims.ae_dim, dims.prefix_dim, dims.state_dim,
+                                        cfg.residual)
+            self.edit = EditActor(self.feat_dim, exec_dim, cfg.edit) if cfg.edit.scale > 0 else None
+            self.target_entropy = -cfg.edit.target_entropy_multiplier * exec_dim
+            groups["residual"] = self.residual.parameters()
+            if self.edit is not None:
+                groups["edit"] = [p for n, p in self.edit.named_parameters() if n != "log_alpha"]
+                groups["alpha"] = [self.edit.log_alpha]
         self.optims = {k: torch.optim.Adam(list(v), lr=cfg.qam.lr) for k, v in groups.items()}
         self.timer = lambda name: contextlib.nullcontext()  # the trainer swaps in monitor.Timer for update/time/*
 
     # ---------------------------------------------------------------- helpers
-    def feat(self, ctx: Context) -> Tensor:
+    def raw_feat(self, ctx: Context) -> Tensor:
         parts = [ctx.h_prefix, ctx.state] + ([ctx.progress[:, None]] if self.cfg.critic.time_feature else [])
         return torch.cat(parts, dim=-1)
+
+    def feat(self, ctx: Context) -> Tensor:
+        """Critic / actor input: pooled prefix features + state (+ progress), standardized per dim. Raw prefix
+        features have norm ~34 with a constant offset of ~33 and 2 dims carrying most of the variance."""
+        return (self.raw_feat(ctx) - self.feat_mean) / self.feat_std
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        for name in ("feat_mean", "feat_std"):  # checkpoints from before standardization: identity = their behaviour
+            state_dict.setdefault(prefix + name, getattr(self, name).new_zeros(self.feat_dim) + (name == "feat_std"))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    @torch.no_grad()
+    def fit_feat_stats(self, raw: Tensor) -> None:
+        self.feat_mean.copy_(raw.mean(0))
+        self.feat_std.copy_(raw.std(0).clamp_min(FEAT_STD_FLOOR))
+
+    def bound_vector(self, bound: float | None = None) -> Tensor:
+        """Per action dim: s (actor.bound, or `bound`) on the pose dims, actor.gripper_bound on the last (gripper)."""
+        b = torch.full((self.dims.action_dim,), float(self.cfg.actor.bound if bound is None else bound))
+        b[-1] = float(self.cfg.actor.gripper_bound)
+        return b.to(self.action_low.device)
+
+    def explore_std(self, bound: float | None = None) -> Tensor:
+        """Std of the collection-time exploration offset per action dim: explore.std_frac * s, 0 where s is 0."""
+        return self.cfg.explore.std_frac * self.bound_vector(bound)
 
     def clip(self, a: Tensor) -> Tensor:
         return torch.clamp(a, self.action_low, self.action_high) if self.cfg.qam.clip_actions else a
@@ -141,8 +191,26 @@ class QAMEAgent(nn.Module):
 
     @torch.no_grad()
     def act(self, ctx: Context, noise: Tensor, use_residual: bool = True, use_edit: bool = True,
-            with_base: bool = False) -> dict:
-        """Executed chunk [B, n_exec, A] (normalized, clipped), plus diagnostics and the same-noise base chunk."""
+            with_base: bool = False, explore_std: Tensor | None = None,
+            generator: torch.Generator | None = None) -> dict:
+        """Executed chunk [B, n_exec, A] (normalized, clipped), plus diagnostics and the same-noise base chunk.
+        use_residual applies the learned correction (velocity residual, or the action residual); use_edit is
+        QAM-E's edit and has no effect in action_residual mode. explore_std [A] adds one Gaussian offset per action
+        dim, held over the chunk (collection and the exploration probe; noise drawn per step would largely cancel
+        within a chunk), drawn from `generator` when given (seeded evaluation)."""
+        if self.actor is not None:
+            x0, stats = self.sample_chunk(ctx, noise, use_residual=False)
+            a_base = self.clip(self.exec_slice(x0))
+            out = {"latent": stats["latent"], "ratio": None, "sat": None, "edit": None, "a_base": a_base}
+            a = a_base
+            if use_residual:
+                out["edit"] = self.actor(self.feat(ctx), a_base)
+                a = a + out["edit"]
+            if explore_std is not None:
+                a = a + torch.randn(a.shape[0], 1, a.shape[-1], device=a.device, generator=generator) * explore_std
+            out["a_exec"] = a = self.clip(a)
+            out["q"] = self.pessimistic_q(ctx, a)
+            return out
         use_residual = use_residual and self.cfg.qam.inv_temp > 0  # QAM: inv_temp == 0 samples the base only
         x0, stats = self.sample_chunk(ctx, noise, use_residual, with_base=with_base and use_residual)
         a = self.clip(self.exec_slice(x0))
@@ -162,7 +230,10 @@ class QAMEAgent(nn.Module):
                     ) -> tuple[Tensor, dict]:
         q_cfg = self.cfg.qam
         with torch.no_grad():
-            next_action = self.act(next_ctx, self.noise(next_ctx))["a_exec"]
+            if self.actor is not None:  # the policy's own noise-free action at s'
+                next_action = self.policy_action(next_ctx)
+            else:
+                next_action = self.act(next_ctx, self.noise(next_ctx))["a_exec"]
             next_q = self.pessimistic_q(next_ctx, next_action, target=True)
             target = reward + q_cfg.discount * mask * next_q
         qs = self.critic(self.feat(ctx), action)
@@ -175,10 +246,51 @@ class QAMEAgent(nn.Module):
             "_q": qs.detach().flatten(),
         }
 
-    def noise(self, ctx: Context) -> Tensor:
-        """Flow start x_1 ~ N(0, I) over the padded chunk, one per batch row."""
+    def noise(self, ctx: Context, generator: torch.Generator | None = None) -> Tensor:
+        """Flow start x_1 ~ N(0, I) over the padded chunk, one per batch row. A per-episode generator keeps π0.5's
+        noise sequence independent of every other random draw (seeded, paired evaluation)."""
         d = self.dims
-        return torch.randn(ctx.h_prefix.shape[0], d.horizon, d.pad_dim, device=ctx.h_prefix.device)
+        return torch.randn(ctx.h_prefix.shape[0], d.horizon, d.pad_dim, device=ctx.h_prefix.device,
+                           generator=generator)
+
+    def policy_action(self, ctx: Context) -> Tensor:
+        """action_residual: clip(a_base + delta(o, a_base)), differentiable in the actor."""
+        return self.clip(ctx.a_base + self.actor(self.feat(ctx), ctx.a_base))
+
+    def actor_loss(self, ctx: Context) -> tuple[Tensor, dict, dict]:
+        """Maximize the critic's ensemble mean at the corrected chunk; the critic is frozen for this loss."""
+        feat = self.feat(ctx)
+        delta = self.actor(feat, ctx.a_base)
+        with frozen(self.critic):
+            q = self.critic(feat, self.clip(ctx.a_base + delta)).mean(0)
+        loss = -q.mean()
+        frac = self._bound_frac(delta)
+        info = {"update/actor/q_loss": loss.detach(), "update/actor/abs_frac": frac.mean(),
+                "update/actor/sat_frac": (frac > 0.95).float().mean()}
+        return loss, info, {"actor_delta": delta.detach().flatten()}
+
+    def _bound_frac(self, delta: Tensor) -> Tensor:
+        """|delta| / s on the dims the residual may move."""
+        bound = self.actor.bound
+        return (delta.detach().abs() / bound.clamp_min(1e-8))[..., bound > 0]
+
+    @torch.no_grad()
+    def action_metrics(self, ctx: Context, a_exec: Tensor, rtg: Tensor) -> dict:
+        """Does the critic tell actions apart (warm-up gate)? On held-out chunks executed with exploration noise:
+        gate/q_action_diff = mean |Q(o, a_exec) - Q(o, a_base)|; gate/action_skill = 1 - MSE(Q(o, a_exec), G) /
+        MSE(Q(o, a_base), G), > 0 when the executed action improves the return prediction (approximate: Q is for the
+        noise-free policy, the return G was realized with exploration)."""
+        q_exec, q_base = self.pessimistic_q(ctx, a_exec), self.pessimistic_q(ctx, ctx.a_base)
+        with torch.enable_grad():
+            a = ctx.a_base.detach().clone().requires_grad_(True)
+            (grad,) = torch.autograd.grad(self.critic(self.feat(ctx), a).mean(0).sum(), a)
+        mse_base = (q_base - rtg).pow(2).mean().clamp_min(1e-12)
+        out = {"gate/q_action_diff": (q_exec - q_base).abs().mean(), "gate/dq_da_norm": grad.flatten(1).norm(dim=-1).mean(),
+               "gate/action_skill": 1 - (q_exec - rtg).pow(2).mean() / mse_base}
+        if self.actor is not None:
+            frac = self._bound_frac(self.actor(self.feat(ctx), ctx.a_base))
+            out.update({"gate/residual_frac": frac.mean(), "gate/residual_sat_frac": (frac > 0.95).float().mean()})
+        return out
 
     def terminal_adjoint(self, ctx: Context, a_full: Tensor) -> Tensor:
         """-inv_temp * dQ/da on the executed slice; zero on unexecuted positions and padded dims."""
@@ -278,19 +390,27 @@ class QAMEAgent(nn.Module):
                 "update/edit/abs_norm": (self.cfg.edit.scale * edit).abs().mean().detach()}
         return actor_loss, alpha_loss, info, {"edit": (self.cfg.edit.scale * edit).detach().flatten()}
 
-    def update(self, ctx: Context, action: Tensor, reward: Tensor, mask: Tensor, next_ctx: Context
-               ) -> tuple[dict, dict]:
-        """One QAM-E step: all losses use the pre-update parameters (as in QAM's joint loss), then each module steps."""
+    def update(self, ctx: Context, action: Tensor, reward: Tensor, mask: Tensor, next_ctx: Context,
+               actor: bool = False) -> tuple[dict, dict]:
+        """One step: all losses use the pre-update parameters (as in QAM's joint loss), then each module steps.
+        action_residual trains the actor only when `actor` (off during the critic warm-up; every rank must pass
+        the same value); qam_velocity always trains the residual and the edit."""
         with self.timer("critic"):
             critic_loss, info = self.critic_loss(ctx, action, reward, mask, next_ctx)
-        residual_loss, res_info, hist = self.residual_loss(ctx)
-        info.update(res_info)
-        losses = {"critic": critic_loss, "residual": residual_loss}
-        if self.edit is not None:
-            with self.timer("edit"):
-                losses["edit"], losses["alpha"], edit_info, edit_hist = self.edit_losses(ctx)
-            info.update(edit_info)
-            hist.update(edit_hist)
+        losses, hist = {"critic": critic_loss}, {}
+        if self.actor is not None:
+            if actor:
+                with self.timer("actor"):
+                    losses["actor"], actor_info, hist = self.actor_loss(ctx)
+                info.update(actor_info)
+        else:
+            losses["residual"], res_info, hist = self.residual_loss(ctx)
+            info.update(res_info)
+            if self.edit is not None:
+                with self.timer("edit"):
+                    losses["edit"], losses["alpha"], edit_info, edit_hist = self.edit_losses(ctx)
+                info.update(edit_info)
+                hist.update(edit_hist)
         for opt in self.optims.values():
             opt.zero_grad(set_to_none=True)
         with self.timer("backward"):

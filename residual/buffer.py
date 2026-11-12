@@ -38,7 +38,8 @@ def field_specs(image_shape: tuple[int, ...], d: "Dims") -> dict[str, tuple[str,
         "state_norm": ("float32", (d.state_dim,)),  # as the policy saw it (critic features without a π0.5 pass)
         "task": ("int16", ()), "episode": ("int32", ()), "step": ("int16", ()),
         "a_exec": ("float32", (d.exec_horizon, d.action_dim)),  # normalized, clipped, edited: the TD action
-        "a_base": ("float32", (d.exec_horizon, d.action_dim)),  # π0.5 alone from the same noise (diagnostic only)
+        # π0.5 alone from the same noise: the action residual's input (critic target and actor loss use it)
+        "a_base": ("float32", (d.exec_horizon, d.action_dim)),
         "noise": ("float16", (d.horizon, d.pad_dim)),
         "h_prefix": ("float16", (d.prefix_dim,)), "latent": ("float16", (d.ae_dim,)),
         "steered": ("bool", ()), "trigger": ("uint8", ()), "terminal": ("bool", ()), "success": ("bool", ()),

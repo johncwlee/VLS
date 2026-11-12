@@ -1,4 +1,4 @@
-"""One LIBERO episode with π0.5 + residual (+ edit) through the VLS LiberoAdapter, mirroring main.py's loop:
+"""One LIBERO episode with π0.5 + residual (+ edit or exploration noise) through the VLS LiberoAdapter, mirroring main.py's loop:
 a new chunk every `exec_horizon` steps, unnormalized by the policy postprocessor, gripper binarized by the
 adapter, success/termination from the env (spec §7.1 labels: `label_source = "sim"` until the VLM judge exists).
 """
@@ -77,8 +77,14 @@ class Episode:
 
 
 def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_state: np.ndarray, t_max: int,
-                use_residual: bool, use_edit: bool, record_video: bool = False) -> Episode:
-    adapter.reset(options={"init_state": init_state})
+                use_residual: bool, use_edit: bool, record_video: bool = False, seed: int | None = None,
+                explore_std: torch.Tensor | None = None) -> Episode:
+    """seed (evaluation) fixes the scene and π0.5's noise: LIBERO re-draws fixture poses (cabinets, stoves) from
+    np.random at every reset, which set_init_state does not restore, and π0.5's flow noise (then any exploration
+    offset) comes from its own generator: a policy draws the same flow noise as the baseline it is paired with.
+    Without a seed, both follow the global RNGs (training collection)."""
+    adapter.reset(seed=None if seed is None else seed % 2 ** 32, options={"init_state": init_state})
+    generator = None if seed is None else torch.Generator(pi05.device).manual_seed(seed)
     dims, std = agent.dims, pi05.action_std.numpy()
     rows, frames, q_values = defaultdict(list), ([] if record_video else None), []
     steps, chunk, info, policy_time = 0, 0, {}, 0.0
@@ -88,8 +94,9 @@ def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_st
         start = time.perf_counter()
         batch = pi05.preprocess(image, image2, state, obs["task"])
         ctx = pi05.context(batch, torch.tensor([chunk / t_max]))
-        noise = agent.noise(ctx)
-        out = agent.act(ctx, noise, use_residual=use_residual, use_edit=use_edit, with_base=True)
+        noise = agent.noise(ctx, generator)
+        out = agent.act(ctx, noise, use_residual=use_residual, use_edit=use_edit, with_base=True,
+                        explore_std=explore_std, generator=generator)
         raw = pi05.unnormalize(out["a_exec"])[0]
         policy_time += time.perf_counter() - start
 

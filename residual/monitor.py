@@ -1,6 +1,6 @@
 """Training monitor: metrics.jsonl / episodes.jsonl in the run dir always, wandb when enabled.
 
-Every scalar row carries its step axes (update_step, env_step, round, stage) so the jsonl alone is enough for
+Every scalar row carries its step axes (update_step, env_step, round, stage, chunks) so the jsonl alone is enough for
 `python -m residual.plot_run <run_dir>`, and wandb plots each metric group against the right axis.
 """
 
@@ -22,7 +22,24 @@ log = logging.getLogger(__name__)
 
 # metric prefix -> step axis
 AXES = {"update": "update_step", "buffer": "update_step", "hist": "update_step", "episode": "env_step",
-        "round": "round", "eval": "round", "gate": "round", "video": "round"}
+        "round": "round", "eval": "round", "gate": "round", "video": "round", "progress": "round"}
+
+
+def paired_stats(policy: dict[str, bool], baseline: dict[str, bool]) -> dict:
+    """Paired success difference over the episode keys both share (same task, init and seeds): mean, standard error,
+    z (omitted when the standard error is 0) and the fraction of episodes whose outcome flipped."""
+    keys = sorted(policy.keys() & baseline.keys())
+    if not keys:
+        return {}
+    p = np.array([policy[k] for k in keys], dtype=float)
+    b = np.array([baseline[k] for k in keys], dtype=float)
+    d = p - b
+    se = float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1 else 0.0
+    out = {"paired_n": len(d), "success": float(p.mean()), "baseline_success": float(b.mean()),
+           "paired_diff": float(d.mean()), "paired_se": se, "flip_frac": float((d != 0).mean())}
+    if se > 0:
+        out["paired_z"] = float(d.mean() / se)
+    return out
 
 
 def _scalar(value):
@@ -42,7 +59,8 @@ def save_video(run_dir: Path, name: str, frames: list[np.ndarray], fps: int) -> 
 
 
 class Monitor:
-    def __init__(self, cfg, run_dir: Path):
+    def __init__(self, cfg, run_dir: Path, extra_config: dict | None = None):
+        """extra_config: run facts not in the yaml (GPU count, effective batch), added to the wandb config."""
         self.run_dir = run_dir
         self.metrics = (run_dir / "metrics.jsonl").open("a")
         self.episodes = (run_dir / "episodes.jsonl").open("a")
@@ -65,7 +83,9 @@ class Monitor:
         id_file.write_text(run_id)
         self.wandb = wandb.init(project=wcfg.project, entity=wcfg.entity, group=wcfg.group, tags=list(wcfg.tags),
                                 mode=wcfg.mode, dir=str(run_dir), id=run_id, resume="allow", name=wcfg.name or run_dir.name,
-                                config=OmegaConf.to_container(cfg, resolve=True))
+                                job_type=cfg.mode,
+                                config={**OmegaConf.to_container(cfg, resolve=True), **(extra_config or {})})
+        wandb.define_metric("chunks")  # chunk transitions collected: any metric can be plotted against it
         for prefix, axis in AXES.items():
             wandb.define_metric(axis)
             wandb.define_metric(f"{prefix}/*", step_metric=axis)
