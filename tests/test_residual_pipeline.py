@@ -62,8 +62,9 @@ def test_warmup_stop_resume_actor_and_repeatable_eval(tmp_path):
     assert warmup_eval and warmup_eval[0]["eval/policy/flip_frac"] == 0  # zero residual == π0.5, same seeds
     wandb_id = (run_dir / "wandb_id.txt").read_text()
 
+    # A few episodes cannot train an action-skilled critic: open the gate to test the actor-on path.
     launch(tmp_path / "hydra_resume", f"train.resume_dir={run_dir}", "online.rounds=4", "actor.gate_q_diff=0",
-           "actor.max_warmup_rounds=5")
+           "actor.gate_min_skill=null", "actor.max_warmup_rounds=5")
     state = torch.load(run_dir / "last.pt", weights_only=True)["state"]
     assert state["round"] == 4 and state["actor_on"]
     assert sum(e.get("stage") == 1 for e in jsonl(run_dir / "episodes.jsonl")) == 2  # Stage 1 not re-collected

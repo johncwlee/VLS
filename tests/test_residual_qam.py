@@ -350,12 +350,28 @@ def test_action_gate_separates_action_blind_and_action_aware_critics():
     agent.critic = StateOnlyQ()
     blind = agent.action_metrics(ctx, a_exec, rtg)
     assert blind["gate/q_action_diff"] == 0 and blind["gate/dq_da_norm"] == 0
-    assert blind["gate/q_action_diff"] < agent.cfg.actor.gate_q_diff
+    assert not agent.gate_passed(blind)
     agent.critic = AnalyticQ()
     aware = agent.action_metrics(ctx, a_exec, rtg)
     assert aware["gate/q_action_diff"] > agent.cfg.actor.gate_q_diff
     assert aware["gate/action_skill"] > 0.5
     assert aware["gate/residual_frac"] == 0
+    assert agent.gate_passed(aware)
+
+
+def test_gate_rejects_an_untrained_critic_that_reacts_to_actions_at_random():
+    """The reason for gate_min_skill: random action sensitivity passes the Q-difference threshold alone."""
+    torch.manual_seed(0)
+    agent = make_agent("action_residual", critic={"hidden_dims": [64, 64]})
+    ctx = with_base(context(512), torch.zeros(512, 1, 2))
+    a_exec = ctx.a_base + torch.randn(512, 1, 2) * agent.explore_std()
+    reward = -10 * (a_exec[:, 0, 0] - S) ** 2
+    random = agent.action_metrics(ctx, a_exec, reward)
+    assert random["gate/q_action_diff"] > agent.cfg.actor.gate_q_diff  # the difference alone would pass
+    assert not agent.gate_passed(random)
+    assert not agent.gate_passed({})  # no held-out online data yet
+    off = make_agent("action_residual", critic={"hidden_dims": [64, 64]}, actor={"gate_min_skill": None})
+    assert off.gate_passed(random)  # null = Q difference only
 
 
 def test_warmup_then_actor_moves_toward_the_better_action():
@@ -375,7 +391,7 @@ def test_warmup_then_actor_moves_toward_the_better_action():
         agent.update(*args)
     after = agent.action_metrics(ctx, a_exec, reward)
     assert before["gate/action_skill"] < 0.5 < after["gate/action_skill"]
-    assert after["gate/q_action_diff"] > agent.cfg.actor.gate_q_diff
+    assert not agent.gate_passed(before) and agent.gate_passed(after)
     for _ in range(300):
         agent.update(*args, actor=True)
     assert agent.actor(agent.feat(ctx), ctx.a_base)[..., 0].mean() > 0.5 * S

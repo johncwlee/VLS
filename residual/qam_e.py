@@ -276,7 +276,8 @@ class QAMEAgent(nn.Module):
 
     @torch.no_grad()
     def action_metrics(self, ctx: Context, a_exec: Tensor, rtg: Tensor) -> dict:
-        """Does the critic tell actions apart (warm-up gate)? On held-out chunks executed with exploration noise:
+        """Does the critic tell actions apart (warm-up gate, see gate_passed)? On held-out chunks executed with
+        exploration noise:
         gate/q_action_diff = mean |Q(o, a_exec) - Q(o, a_base)|; gate/action_skill = 1 - MSE(Q(o, a_exec), G) /
         MSE(Q(o, a_base), G), > 0 when the executed action improves the return prediction (approximate: Q is for the
         noise-free policy, the return G was realized with exploration)."""
@@ -291,6 +292,16 @@ class QAMEAgent(nn.Module):
             frac = self._bound_frac(self.actor(self.feat(ctx), ctx.a_base))
             out.update({"gate/residual_frac": frac.mean(), "gate/residual_sat_frac": (frac > 0.95).float().mean()})
         return out
+
+    def gate_passed(self, metrics: dict) -> bool:
+        """Warm-up gate on action_metrics: the critic reacts to the executed action (q_action_diff >= gate_q_diff)
+        and that reaction is learned, not random: it improves the held-out return prediction
+        (action_skill > gate_min_skill; null skips this check). False without held-out online data."""
+        cfg = self.cfg.actor
+        diff, skill = metrics.get("gate/q_action_diff"), metrics.get("gate/action_skill")
+        if diff is None or diff < cfg.gate_q_diff:
+            return False
+        return cfg.gate_min_skill is None or (skill is not None and skill > cfg.gate_min_skill)
 
     def terminal_adjoint(self, ctx: Context, a_full: Tensor) -> Tensor:
         """-inv_temp * dQ/da on the executed slice; zero on unexecuted positions and padded dims."""

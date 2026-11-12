@@ -21,6 +21,9 @@ actor:                        # which steering policy is trained
   activation: gelu
   gate_q_diff: 0.05           # warm-up: the actor stays at zero until the held-out same-state Q difference
                               # mean |Q(o,a_exec) - Q(o,a_base)| reaches this (it was 0.003 on 2026-11-10)
+  gate_min_skill: 0.0         # ... and gate/action_skill exceeds this: the executed action must improve the critic's
+                              # held-out return prediction. An untrained critic already has a large Q difference
+                              # (random action sensitivity), so the difference alone passes spuriously. null = off
   max_warmup_rounds: 20       # stop (resumable) if the gate has not passed by this round
 
 explore:                      # collection only (never at evaluation or in the critic target)

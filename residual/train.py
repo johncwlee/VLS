@@ -625,7 +625,8 @@ class Trainer:
         warmup = self.action_mode and not s["actor_on"]
         if warmup and rnd > cfg.actor.max_warmup_rounds:
             log.warning(f"Stopping: the action gate did not pass in actor.max_warmup_rounds={cfg.actor.max_warmup_rounds}"
-                        f" rounds (needs gate/q_action_diff >= {cfg.actor.gate_q_diff}; see gate/* in metrics.jsonl). "
+                        f" rounds (needs gate/q_action_diff >= {cfg.actor.gate_q_diff} and gate/action_skill > "
+                        f"{cfg.actor.gate_min_skill}; see gate/* in metrics.jsonl). "
                         f"Resume with a larger actor.max_warmup_rounds to keep warming up the critic.")
             return False
         start = time.perf_counter()
@@ -655,14 +656,15 @@ class Trainer:
     def _warmup_decision(self, rnd: int, gate: dict | None) -> None:
         """Every rank gets the same gate dict and flips together: the actor flag decides which parameters get
         gradients, and the all-reduce must match across ranks."""
-        diff, threshold = (gate or {}).get("gate/q_action_diff"), self.cfg.actor.gate_q_diff
-        if diff is not None and diff >= threshold:
+        gate, cfg = gate or {}, self.cfg.actor
+        values = (f"gate/q_action_diff {gate.get('gate/q_action_diff')} (needs >= {cfg.gate_q_diff}), "
+                  f"gate/action_skill {gate.get('gate/action_skill')} (needs > {cfg.gate_min_skill})")
+        if self.agent.gate_passed(gate):
             self.state["actor_on"] = True
-            log.info(f"Round {rnd}: action gate passed (gate/q_action_diff {diff:.4f} >= {threshold}); "
-                     f"actor updates start next round")
+            log.info(f"Round {rnd}: action gate passed: {values}; actor updates start next round")
         else:
-            log.info(f"Round {rnd}: critic warm-up, gate/q_action_diff {diff} < {threshold}"
-                     + ("" if diff is not None else " (no held-out online episode yet)"))
+            log.info(f"Round {rnd}: critic warm-up, {values}"
+                     + ("" if "gate/q_action_diff" in gate else " (no held-out online episode yet)"))
 
     def run_eval(self) -> None:
         """mode=eval: π0.5 baseline on items without a stored outcome, then policy.residual_ckpt and each
