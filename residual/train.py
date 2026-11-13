@@ -2,8 +2,9 @@
 
 Baseline: plain π0.5 on seeded eval items (task, init set, init id); every later evaluation is paired with it.
 Stage 1: π0.5-only rollouts on seeded train inits -> protected pool (some episodes held out for the gate).
-Stage 2: offline updates on the protected pool (critic only in action_residual mode); critic features are standardized
-  with the pool's statistics first. Gate = critic Q vs realized return-to-go on held-out episodes.
+Stage 2: offline.updates on the protected pool (critic only in action_residual mode; 0 by default, so the pool only
+  feeds the online batches); critic features are standardized with the pool's statistics first. Gate = critic Q vs
+  realized return-to-go on held-out episodes.
 Stage 3: rounds of [collect into the online pool; 50:50 updates; gate; paired eval every eval.every_rounds].
   action_residual: collection adds exploration noise. The actor stays at zero (critic warm-up) until the held-out
   same-state Q difference reaches actor.gate_q_diff; the run stops after actor.max_warmup_rounds if it never does.

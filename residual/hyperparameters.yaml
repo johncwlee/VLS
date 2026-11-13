@@ -105,8 +105,11 @@ offline:                      # spec Stages 1-2
   episodes_per_task: 20       # π0.5-only rollouts (residual zero, edit off) into the protected pool;
                               # 40 tasks x 20 x ~10 s ≈ 2.5 h
   heldout_frac: 0.1           # episodes kept out of training for the Stage 2 gate (Q vs return-to-go)
-  updates: 2000               # offline updates (critic only in action_residual mode; qam_velocity: ~2 h at batch
-                              # 32 on one RTX 5090, measured 2026-11-08)
+  updates: 0                  # Stage 2 offline updates before round 1. 0 = none (RLPD: the offline pool is only
+                              # mixed into online batches, and the warm-up rounds train the critic). Above 0: critic
+                              # pre-training on the offline pool (critic only in action_residual mode). 2000 until
+                              # 2026-11-13: held-out Q-vs-return corr only 0.24-0.45 after it, 0.75-0.95 from the
+                              # online rounds. qam_velocity used 2000 (~2 h at batch 32 on one RTX 5090)
 
 online:                       # spec Stage 3 (no agent yet)
   rounds: 50
