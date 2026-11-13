@@ -136,6 +136,8 @@ eval:                         # seeded, paired episodes through the VLS LiberoAd
   seed: 0                     # with (suite, task, init set, init id) -> the episode seed for the env reset (fixture
                               # poses) and π0.5's flow noise, so two evaluations differ only by the policy
   explore_bounds: []          # mode=eval: also π0.5 + exploration noise at each s, e.g. [0.1,0.2,0.4] (probe)
+  baseline_ckpt: null         # a checkpoint whose stored baseline outcomes this run reuses (only those, not its
+                              # weights), so the baseline is not re-evaluated; items it lacks are still run
 
 logging:
   log_every_updates: 50       # update scalars are averaged over this window

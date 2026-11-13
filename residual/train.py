@@ -112,6 +112,8 @@ class Trainer:
             payload = torch.load(cfg.policy.residual_ckpt, weights_only=True)
             self.agent.load_state_dict(payload["agent"])
             self.state["baseline"].update(payload["state"].get("baseline", {}))
+        if cfg.eval.baseline_ckpt:  # baseline outcomes only: any actor.bound / architecture can pair with them
+            self.state["baseline"].update(torch.load(cfg.eval.baseline_ckpt, weights_only=True)["state"]["baseline"])
         libero_env = self.adapter(self.tasks[0])._env[0]
         specs = field_specs((3, libero_env.observation_height, libero_env.observation_width), self.dims)
         capacity = 1 if cfg.mode == "eval" else cfg.train.buffer_capacity  # eval collects nothing
