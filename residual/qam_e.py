@@ -87,7 +87,9 @@ class QAMEAgent(nn.Module):
         # feature standardization, fitted once on the offline pool (fit_feat_stats); identity until then
         self.register_buffer("feat_mean", torch.zeros(self.feat_dim))
         self.register_buffer("feat_std", torch.ones(self.feat_dim))
-        self.critic = CriticEnsemble(self.feat_dim + exec_dim, cfg.critic)
+        # action_residual: the critic also gets the residual itself (critic_feat), exec_dim more inputs
+        critic_in = self.feat_dim + exec_dim * (2 if cfg.actor.mode == "action_residual" else 1)
+        self.critic = CriticEnsemble(critic_in, cfg.critic)
         self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
         self.residual = self.edit = self.actor = None
         groups = {"critic": self.critic.parameters()}
@@ -151,8 +153,21 @@ class QAMEAgent(nn.Module):
     def _pad(self, v_phi: Tensor) -> Tensor:
         return F.pad(v_phi, (0, self.dims.pad_dim - self.dims.action_dim))
 
-    def pessimistic_q(self, ctx: Context, action: Tensor, target: bool = False) -> Tensor:
-        qs = (self.target_critic if target else self.critic)(self.feat(ctx), action)
+    def critic_feat(self, ctx: Context, action: Tensor, a_base: Tensor | None = None) -> Tensor:
+        """The critic's non-action input. action_residual appends the residual (action - a_base) / s, the only part
+        of the action that exploration and the actor vary (unit scale under exploration, exactly zero on π0.5's own
+        chunks): inside `action` it is a 0.4-std offset on top of a_base, which the critic cannot see separately.
+        a_base defaults to the stored ctx.a_base. Differentiable in `action`."""
+        feat = self.feat(ctx)
+        if self.actor is None:
+            return feat
+        bound = self.actor.bound
+        residual = (action - (ctx.a_base if a_base is None else a_base)) / torch.where(bound > 0, bound, 1.0)
+        return torch.cat([feat, residual.flatten(1)], dim=-1)
+
+    def pessimistic_q(self, ctx: Context, action: Tensor, target: bool = False, a_base: Tensor | None = None
+                      ) -> Tensor:
+        qs = (self.target_critic if target else self.critic)(self.critic_feat(ctx, action, a_base), action)
         return qs.mean(0) - self.cfg.qam.rho * qs.std(0, unbiased=False)
 
     # ---------------------------------------------------------------- sampling (openpi convention)
@@ -209,7 +224,7 @@ class QAMEAgent(nn.Module):
             if explore_std is not None:
                 a = a + torch.randn(a.shape[0], 1, a.shape[-1], device=a.device, generator=generator) * explore_std
             out["a_exec"] = a = self.clip(a)
-            out["q"] = self.pessimistic_q(ctx, a)
+            out["q"] = self.pessimistic_q(ctx, a, a_base=a_base)
             return out
         use_residual = use_residual and self.cfg.qam.inv_temp > 0  # QAM: inv_temp == 0 samples the base only
         x0, stats = self.sample_chunk(ctx, noise, use_residual, with_base=with_base and use_residual)
@@ -236,7 +251,7 @@ class QAMEAgent(nn.Module):
                 next_action = self.act(next_ctx, self.noise(next_ctx))["a_exec"]
             next_q = self.pessimistic_q(next_ctx, next_action, target=True)
             target = reward + q_cfg.discount * mask * next_q
-        qs = self.critic(self.feat(ctx), action)
+        qs = self.critic(self.critic_feat(ctx, action), action)
         loss = (qs - target).pow(2).mean()
         return loss, {
             "update/critic/loss": loss.detach(), "update/critic/q_mean": qs.mean().detach(),
@@ -261,8 +276,9 @@ class QAMEAgent(nn.Module):
         """Maximize the critic's ensemble mean at the corrected chunk; the critic is frozen for this loss."""
         feat = self.feat(ctx)
         delta = self.actor(feat, ctx.a_base)
+        action = self.clip(ctx.a_base + delta)
         with frozen(self.critic):
-            q = self.critic(feat, self.clip(ctx.a_base + delta)).mean(0)
+            q = self.critic(self.critic_feat(ctx, action), action).mean(0)
         loss = -q.mean()
         frac = self._bound_frac(delta)
         info = {"update/actor/q_loss": loss.detach(), "update/actor/abs_frac": frac.mean(),
@@ -284,7 +300,7 @@ class QAMEAgent(nn.Module):
         q_exec, q_base = self.pessimistic_q(ctx, a_exec), self.pessimistic_q(ctx, ctx.a_base)
         with torch.enable_grad():
             a = ctx.a_base.detach().clone().requires_grad_(True)
-            (grad,) = torch.autograd.grad(self.critic(self.feat(ctx), a).mean(0).sum(), a)
+            (grad,) = torch.autograd.grad(self.critic(self.critic_feat(ctx, a), a).mean(0).sum(), a)
         mse_base = (q_base - rtg).pow(2).mean().clamp_min(1e-12)
         out = {"gate/q_action_diff": (q_exec - q_base).abs().mean(), "gate/dq_da_norm": grad.flatten(1).norm(dim=-1).mean(),
                "gate/action_skill": 1 - (q_exec - rtg).pow(2).mean() / mse_base}
