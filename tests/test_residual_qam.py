@@ -42,7 +42,7 @@ def make_agent(mode: str = "qam_velocity", dims: Dims = DIMS, **overrides) -> QA
     cfg = OmegaConf.load("residual/hyperparameters.yaml")
     base = {"residual": {"hidden_dims": [128, 128], "cap_c": None}, "critic": {"hidden_dims": [32], "num_qs": 2},
             "edit": {"scale": 0.0, "hidden_dims": [32]}, "qam": {"inv_temp": BETA, "clip_actions": False, "lr": 1e-3},
-            "actor": {"mode": mode, "hidden_dims": [64, 64]}}
+            "actor": {"mode": mode, "hidden_dims": [64, 64], "bound": S}, "explore": {"std_frac": 0.5}}
     cfg = OmegaConf.merge(cfg, base, overrides)
     bound = torch.ones(dims.action_dim)
     return QAMEAgent(cfg, dims, toy_base, -10 * bound, 10 * bound)
@@ -208,7 +208,7 @@ def test_data_parallel_update_matches_full_batch(tmp_path, monkeypatch, mode, ac
 
 # ---------------------------------------------------------------- action_residual
 # Toy action dims are (pose, gripper): the residual and the exploration noise may move dim 0 only.
-S = 0.2  # actor.bound default
+S = 0.2  # actor.bound in these tests (pinned in make_agent with explore.std_frac, so retuned defaults do not move them)
 
 
 def with_base(ctx: Context, a_base: torch.Tensor) -> Context:

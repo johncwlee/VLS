@@ -13,21 +13,26 @@ actor:                        # which steering policy is trained
                               #   maximize Q (residual RL, RLPD recipe; default since 2026-11-12)
                               # qam_velocity: velocity residual + QAM-E (residual/qam/edit/offline sections),
                               #   the method of run task/2026-11-10_23-10-26 (tag residual-qam-e-v1)
-  bound: 0.2                  # s: |delta| <= s per pose dim (6 dims), normalized units. 0.1 did not change outcomes
-                              # as edit noise; Policy Decorator reports 0.03-0.5. Pick from the exploration probe;
-                              # sweep {0.1, 0.2, 0.4}
+  bound: 0.4                  # s: |delta| <= s per pose dim (6 dims), normalized units. 0.1 did not change outcomes
+                              # as edit noise; Policy Decorator reports 0.03-0.5. 0.4 gave +0.30 to +0.35 paired
+                              # success on 3 pilot tasks (2026-11-13), with the residual at ~0.97 of the bound;
+                              # 0.2 is untested with the gate below. Sweep {0.2, 0.4, 0.6}
   gripper_bound: 0.0          # s on the gripper dim; 0 = the residual and the exploration noise never touch it
   hidden_dims: [512, 512, 512, 512]
   activation: gelu
-  gate_q_diff: 0.05           # warm-up: the actor stays at zero until the held-out same-state Q difference
-                              # mean |Q(o,a_exec) - Q(o,a_base)| reaches this (it was 0.003 on 2026-11-10)
+  gate_q_diff: 0.005          # warm-up: the actor stays at zero until the held-out same-state Q difference
+                              # mean |Q(o,a_exec) - Q(o,a_base)| reaches this (it was 0.003 on 2026-11-10). At 0.05
+                              # the gate never passed in 20 rounds (twice); the difference reaches only ~0.04 by
+                              # round 70 of a run that learns
   gate_min_skill: 0.0         # ... and gate/action_skill exceeds this: the executed action must improve the critic's
                               # held-out return prediction. An untrained critic already has a large Q difference
                               # (random action sensitivity), so the difference alone passes spuriously. null = off
   max_warmup_rounds: 20       # stop (resumable) if the gate has not passed by this round
 
 explore:                      # collection only (never at evaluation or in the critic target)
-  std_frac: 0.5               # one N(0, (std_frac * s)^2) offset per action dim per chunk, held over its steps
+  std_frac: 1.0               # one N(0, (std_frac * s)^2) offset per action dim per chunk, held over its steps.
+                              # On 3 pilot tasks (2026-11-13, one run each) the gate passed at round 2 with 1.0 and
+                              # at rounds 10 and 14 with 0.5; the round-70 success was the same
 
 env:                          # one run = one LIBERO-PRO perturbation type across suites; one multi-task residual
                               # (π0.5 itself is one policy for all four LIBERO suites). LIBERO env defaults live in
