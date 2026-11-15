@@ -802,6 +802,7 @@ class LiberoAdapter(BaseEnvAdapter):
         self.init_state_mode = env_config.get("init_state_mode", "official")  # see configs/backend/libero.yaml
         if self.init_state_mode not in ("official", "seeded_random"):
             raise ValueError(f"init_state_mode must be 'official' or 'seeded_random', got {self.init_state_mode!r}")
+        self.init_state_dir = env_config.get("init_state_dir")  # see configs/backend/libero.yaml
 
         # total number of episodes to collect, must divide evenly by the number of tasks for desired suites
         self.total_episodes_num = env_config.get("episode_num", self.task_num)
@@ -1578,8 +1579,11 @@ class LiberoAdapter(BaseEnvAdapter):
         init_state_id = None
         if self.init_state_mode == "official" and "init_state" not in options:
             # Episode i of a task starts from the task's stored init state i (wrapping after 50).
-            init_state_id = (self.current_episode_idx % self.episodes_per_task) % len(current_env._init_states)
-            options["init_state"] = current_env._init_states[init_state_id]
+            init_states = current_env._init_states
+            if self.init_state_dir:
+                init_states = np.load(Path(self.init_state_dir) / self.suite_name / f"{current_env.task}.npy")
+            init_state_id = (self.current_episode_idx % self.episodes_per_task) % len(init_states)
+            options["init_state"] = init_states[init_state_id]
         result = current_env.reset(options=options, **kwargs)
         
         # Cache robot state from observation

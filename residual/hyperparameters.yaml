@@ -107,8 +107,16 @@ qam:                          # inv_temp and use_target_grad: qam_velocity only;
   use_target_grad: true       # the adjoint starts from the target critic's dQ/da (QAM default)
 
 offline:                      # spec Stages 1-2
-  episodes_per_task: 20       # π0.5-only rollouts (residual zero, edit off) into the protected pool;
+  source: pi05                # what fills the protected (offline) pool at Stage 1:
+                              #   pi05: episodes_per_task π0.5-only rollouts per task (default)
+                              #   vls:  the successful VLS episodes under expert_dir, as off-policy expert data
+                              #         (RLPD: the demonstrations' role); no π0.5 rollouts are collected
+  episodes_per_task: 20       # source=pi05: π0.5-only rollouts (residual zero, edit off) into the protected pool;
                               # 40 tasks x 20 x ~10 s ≈ 2.5 h
+  expert_dir: ../../data/residual/vls_expert   # source=vls: episodes recorded by VLS main.py with
+                              # main.record_dir=<this dir> backend.libero.init_state_dir=<split.train_init_dir>
+                              # (<dir>/<suite>/task<id>/init<i>_success.npz; relative to modules/VLS). Chunks keep
+                              # their steered flag; a_base is π0.5's chunk from the same noise
   heldout_frac: 0.1           # episodes kept out of training for the Stage 2 gate (Q vs return-to-go)
   updates: 0                  # Stage 2 offline updates before round 1. 0 = none (RLPD: the offline pool is only
                               # mixed into online batches, and the warm-up rounds train the critic). Above 0: critic

@@ -30,6 +30,11 @@ libero:
   #                  layout drawn from its episode seed (torch.randint in main.py). All VLS results produced before
   #                  2026-11-08 used this mode; select it to reproduce them.
   init_state_mode: official
+  # official mode only: a directory of generated init states (<dir>/<suite_name>/<task name>.npy, written by
+  # residual.make_train_inits; relative to modules/VLS). Episode i of a task then starts from generated state i
+  # instead of official state i, e.g. ../../data/residual/train_inits to collect residual training data that
+  # never touches the 50 test inits. null = the official init states
+  init_state_dir: null
   num_steps_wait: 10
   vlm_camera: agentview
   

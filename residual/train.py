@@ -288,6 +288,42 @@ class Trainer:
                     "return": float(self.returns_to_go(ep.chunks, task.t_max)[0]),
                     "wall": time.perf_counter() - start}
 
+    def import_expert(self) -> None:
+        """offline.source=vls: the successful episodes VLS recorded for this run's tasks (main.py, main.record_dir)
+        are the protected pool, as off-policy chunks. Features are recomputed from the stored images;
+        noise and latent stay zero (VLS does not produce them; the action residual never reads them). Episodes
+        carry stage 0, so the Stage 1 plan does not count them, and a resumed run skips the files it has."""
+        cfg = self.cfg
+        for task in self.tasks if self.rank == 0 else []:
+            task_dir = Path(cfg.offline.expert_dir) / task.suite / f"task{task.task_id}"
+            for path in sorted(task_dir.glob("*_success.npz")):
+                if self.buffer.episode_count(expert=path.name, suite=task.suite, task=task.task_id):
+                    continue
+                data = np.load(path)
+                n = len(data["a_exec"])
+                chunks = {k: data[k] for k in ("image", "image2", "state", "steered", "terminal", "success")}
+                chunks.update(task=np.full(n, task.index, dtype=np.int16), step=np.arange(n, dtype=np.int16),
+                              trigger=np.zeros(n, dtype=np.uint8))
+                ctx = self._context(chunks)
+                chunks.update({k: self.agent.clip(torch.from_numpy(data[k]).to(cfg.device)).cpu().numpy()
+                               for k in ("a_exec", "a_base")},
+                              h_prefix=ctx.h_prefix.float().cpu().numpy().astype(np.float16),
+                              state_norm=ctx.state.cpu().numpy())
+                slot = len(self.buffer.episodes)
+                meta = {"stage": 0, "round": 0, "suite": task.suite, "task": task.task_id, "expert": path.name,
+                        "init_id": int(data["init_id"]), "success": True, "steps": int(data["steps"]),
+                        "label_source": LABEL_SOURCE}
+                self.buffer.add_episode(chunks, meta, online=False, heldout=bool(
+                    np.random.default_rng([cfg.seed, slot]).random() < cfg.offline.heldout_frac))
+        if self.rank == 0:
+            if not self.buffer.size:
+                raise SystemExit("offline.source=vls: no *_success.npz of this run's tasks under "
+                                 f"{cfg.offline.expert_dir}")
+            log.info(f"Offline pool: {self.buffer.episode_count(stage=0)} VLS episodes, {self.buffer.size} chunks")
+        self._barrier()
+        if self.rank > 0:
+            self.buffer.reload()
+
     def _record_episode(self, result: dict, *, stage: int, rnd: int, online: bool) -> None:
         task, ep, init_id, ret = self.tasks[result["task"]], result["ep"], result["init_id"], result["return"]
         for error in result["errors"]:
@@ -606,8 +642,13 @@ class Trainer:
         if s["stage"] == 1:
             if cfg.eval.baseline_at_start:
                 self._ensure_baseline(cfg.eval.final_episodes_per_task)
-            plan = self.remaining([cfg.offline.episodes_per_task] * len(self.tasks), stage=1, rnd=0)
-            self.collect(plan, stage=1, rnd=0, online=False, use_residual=False, use_edit=False)
+            if cfg.offline.source == "vls":
+                self.import_expert()
+            elif cfg.offline.source == "pi05":
+                plan = self.remaining([cfg.offline.episodes_per_task] * len(self.tasks), stage=1, rnd=0)
+                self.collect(plan, stage=1, rnd=0, online=False, use_residual=False, use_edit=False)
+            else:
+                raise SystemExit(f"offline.source must be 'pi05' or 'vls', got {cfg.offline.source!r}")
             self._fit_feat_stats()
             s["stage"] = 2
             self._save("last.pt")

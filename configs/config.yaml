@@ -47,6 +47,11 @@ main:
   # Per-step records (episode_k/steps.jsonl): executed action + measured EE pose, so
   # scripts/calibrate_ee_model.py --from_logs can check the EE path model on real policy actions
   log_steps: false
+  # Residual expert data (pi0.5 on LIBERO): save every episode as one .npz of replay-buffer rows (residual/buffer.py:
+  # images, state, executed chunk, pi0.5's chunk from the same noise, steered flag) under
+  # <record_dir>/<suite>/task<id>/, read by residual.train's offline.expert_dir. +1 pi0.5 sample per guided chunk.
+  # Use with backend.libero.init_state_dir so the data comes from train inits. Relative to modules/VLS. null = off
+  record_dir: null
   # Action -> predicted EE path model (backend.<name>.ee_prediction): null = the backend's default, except
   # that grasp steering switches LIBERO to `lag` (it measures real centimetres); or force constant | lag
   ee_prediction: null

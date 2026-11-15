@@ -537,7 +537,7 @@ class Main:
             os.makedirs(episode_dir, exist_ok=True)
             
             # Reset environment
-            self.adapter.reset(seed=episode_seed)
+            reset_out = self.adapter.reset(seed=episode_seed)
             
             # Update guide_scale for current task (may change when switching tasks)
             task_info = self.adapter.get_task_info()
@@ -584,6 +584,8 @@ class Main:
             try:
                 self._run_episode(episode, episode_dir)
                 trial['outcome'] = 'success' if self.success_count > successes_before else 'fail'
+                if self.config.get('record_dir'):
+                    self._save_recording(reset_out[1], episode_seed, trial['outcome'] == 'success')
                 if self.config.get('analysis_logs', False):
                     trial['gripper_closes'] = self.episode_closes  # state at each close command (evaluation only)
                 if self.grasp_steering is not None:  # 0 = the episode ran as plain VLS (no usable grasp target)
@@ -661,6 +663,34 @@ class Main:
         with open(os.path.join(episode_dir, 'chunks.jsonl'), 'a') as f:
             f.write(json.dumps(record) + "\n")
 
+    def _record_chunk(self, unsteered) -> None:
+        """Append the chunk just sampled as one replay-buffer row of the residual (residual/buffer.py): the
+        observation it was sampled from, the executed normalized chunk (a_exec) and pi0.5's chunk from the same
+        initial noise (a_base: the unsteered twin of the executed particle; the chunk itself when not steered).
+        """
+        from residual.rollout import snapshot
+        image, image2, state = snapshot(self.adapter.get_policy_observation(sample_num=1))
+        horizon = self.policy._action_chunk_horizon  # an unguided sample is the full 50-step chunk
+        executed = self.policy._cached_action_chunk[0, :horizon]
+        steered = unsteered is not None
+        base = unsteered[self.policy.last_chunk_stats.get('executed_ancestor', 0), :horizon] if steered else executed
+        for key, value in (('image', image[0]), ('image2', image2[0]), ('state', state[0]),
+                           ('a_exec', executed.float().cpu().numpy()), ('a_base', base.float().cpu().numpy()),
+                           ('steered', steered)):
+            self.recorded_chunks.setdefault(key, []).append(value)
+
+    def _save_recording(self, reset_info: dict, seed: int, success: bool) -> None:
+        """Write the episode's rows to <record_dir>/<suite>/task<id>/init<init id>_<outcome>.npz, with the facts
+        needed to replay it (init state id, reset seed)."""
+        rows = {k: np.stack(v) for k, v in self.recorded_chunks.items()}
+        terminal = np.arange(len(rows['a_exec'])) == len(rows['a_exec']) - 1
+        out_dir = os.path.join(self.config.record_dir, self.adapter.suite_name, f"task{reset_info['task_id']}")
+        os.makedirs(out_dir, exist_ok=True)
+        name = f"init{reset_info['init_state_id']}_{'success' if success else 'fail'}.npz"
+        np.savez_compressed(os.path.join(out_dir, name), **rows, terminal=terminal, success=terminal & success,
+                            init_id=reset_info['init_state_id'], seed=seed, steps=self.episode_steps)
+        log.info(f"Recorded {len(terminal)} chunks to {os.path.join(out_dir, name)}")
+
     def _gripper_close_record(self, step: int, stage: int, use_guidance: bool, ee_pos: np.ndarray,
                               prev_ee_pos: Optional[np.ndarray], objects: list) -> dict:
         """Evaluation only: how the gripper closed (trials.jsonl gripper_closes). speed_cm is the TCP motion of the
@@ -730,6 +760,7 @@ class Main:
         start_heights = object_heights() if object_heights else {}
         self.episode_max_lift = {name: 0.0 for name in start_heights}
         self.episode_closes, prev_ee_pos, prev_grip = [], None, -1.0
+        self.recorded_chunks = {}  # main.record_dir: replay-buffer rows of this episode
         
         # Default: start with stage 1 and guidance ON
         current_stage = 1
@@ -774,7 +805,7 @@ class Main:
                     log_twin = self.config.get('log_unsteered', False) and self.config.get('analysis_logs', False)
                     coupling = (grasp_stage and self.grasp_steering.cfg['mode'].startswith('coupled')
                                 and (self.grasp_steering.reward is None or self.grasp_steering.reward.committed is None))
-                    if hasattr(self.policy, 'sample_unsteered') and (log_twin or coupling):
+                    if hasattr(self.policy, 'sample_unsteered') and (log_twin or coupling or self.config.get('record_dir')):
                         unsteered = self.policy.sample_unsteered(observation)
                     if grasp_stage:
                         keypoint_names = [self.segment_id_to_name.get(m) for m in mask_ids]
@@ -827,6 +858,9 @@ class Main:
                     executed_poses = self.grasp_steering.after_chunk(self.policy._cached_action_chunk[:1], global_steps)
                 if self.config.get('analysis_logs', False) and hasattr(self.policy, 'last_chunk_stats'):  # pi0.5 only
                     self._log_chunk(episode_dir, global_steps, current_stage, grasp_active, unsteered, executed_poses)
+
+            if generate_new_chunk and self.config.get('record_dir'):
+                self._record_chunk(unsteered if use_guidance else None)
 
             if hasattr(self.adapter, 'env_postprocessor'):
                 action_transition = {"action": action_chunk}
@@ -928,6 +962,7 @@ class Main:
                 self.video_recorder.save_video(save_path=video_path, success=is_success, behavior_name=behavior_name)
                 break
         
+        self.episode_steps = global_steps
         log.info(f"Episode {episode+1} finished, success: {info.get('success', False)}, steps: {global_steps}")
     
     def _plot_behavior_stats(self):
