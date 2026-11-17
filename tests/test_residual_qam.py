@@ -226,8 +226,12 @@ class LinearQ(nn.Module):
 
 
 class StateOnlyQ(nn.Module):
+    def __init__(self, feat_dim):
+        super().__init__()
+        self.feat_dim = feat_dim  # action_residual appends the residual to feat (critic_feat): ignore it too
+
     def forward(self, feat, action):
-        q = feat.sum(-1) + 0 * action.flatten(1).sum(-1)  # in the graph, zero gradient
+        q = feat[..., :self.feat_dim].sum(-1) + 0 * (feat.sum(-1) + action.flatten(1).sum(-1))  # zero gradient
         return torch.stack([q, q])
 
 
@@ -286,7 +290,7 @@ def test_actor_climbs_a_linear_critic_to_its_bound():
 def test_critic_target_is_the_noise_free_policy_action():
     torch.manual_seed(0)
     agent = make_agent("action_residual")
-    ctx, nxt = context(8), with_base(context(8), torch.randn(8, 1, 2))
+    ctx, nxt = with_base(context(8), torch.randn(8, 1, 2)), with_base(context(8), torch.randn(8, 1, 2))
     args = (ctx, torch.randn(8, 1, 2), -torch.ones(8), torch.ones(8), nxt)
     first = agent.critic_loss(*args)[1]["update/critic/target_mean"]
     assert torch.equal(first, agent.critic_loss(*args)[1]["update/critic/target_mean"])
@@ -347,7 +351,7 @@ def test_action_gate_separates_action_blind_and_action_aware_critics():
     ctx = with_base(context(256), torch.randn(256, 1, 2))
     a_exec = ctx.a_base + 0.3 * torch.randn(256, 1, 2)
     rtg = -((a_exec - C) ** 2).sum((-1, -2))  # the return depends on the executed action
-    agent.critic = StateOnlyQ()
+    agent.critic = StateOnlyQ(agent.feat_dim)
     blind = agent.action_metrics(ctx, a_exec, rtg)
     assert blind["gate/q_action_diff"] == 0 and blind["gate/dq_da_norm"] == 0
     assert not agent.gate_passed(blind)
