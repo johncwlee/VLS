@@ -6,8 +6,8 @@ Stage 2: offline.updates on the protected pool (critic only in action_residual m
   feeds the online batches); critic features are standardized with the pool's statistics first. Gate = critic Q vs
   realized return-to-go on held-out episodes.
 Stage 3: rounds of [collect into the online pool; 50:50 updates; gate; paired eval every eval.every_rounds].
-  action_residual: collection adds exploration noise. The actor stays at zero (critic warm-up) until the held-out
-  same-state Q difference reaches actor.gate_q_diff; the run stops after actor.max_warmup_rounds if it never does.
+  action_residual: collection adds exploration noise. The actor stays at zero for the first actor.warmup_rounds
+  rounds (critic warm-up); gate/* is logged only.
   qam_velocity: collection and updates as QAM-E (velocity residual + edit).
 Run from the repo root: scripts/run/run_residual.sh [overrides]; resume with train.resume_dir=<run dir>.
 Multi-GPU (-g N, torchrun): one rank per GPU, each with its own π0.5 and envs. Collection runs in waves of one
@@ -106,7 +106,7 @@ class Trainer:
                                self.pi05.action_high).to(cfg.device)
         self.timer = Timer()
         self.agent.timer = self.timer
-        # baseline: {eval_key: success} of plain π0.5; actor_on: action_residual warm-up passed
+        # baseline: {eval_key: success} of plain π0.5; actor_on: action_residual warm-up is over
         self.state = {"stage": 1, "round": 0, "update_step": 0, "best_eval": -1.0, "baseline": {},
                       "actor_on": False, "warmup_eval_done": False}
         if cfg.policy.residual_ckpt:
@@ -117,7 +117,8 @@ class Trainer:
             self.state["baseline"].update(torch.load(cfg.eval.baseline_ckpt, weights_only=True)["state"]["baseline"])
         libero_env = self.adapter(self.tasks[0])._env[0]
         specs = field_specs((3, libero_env.observation_height, libero_env.observation_width), self.dims)
-        capacity = 1 if cfg.mode == "eval" else cfg.train.buffer_capacity  # eval collects nothing
+        # eval collects nothing
+        capacity = 1 if cfg.mode == "eval" else cfg.train.buffer_capacity_per_task * len(self.tasks)
         if self.rank == 0:
             self.buffer = ReplayBuffer(run_dir / "buffer", capacity, specs)
         self._barrier()
@@ -659,31 +660,25 @@ class Trainer:
             self._barrier()  # ranks > 0 load stage2.pt each round when reinit_each_round
             s["stage"] = 3
             self._save("last.pt")
-        while s["round"] < cfg.online.rounds and self._round(s["round"] + 1):
-            pass
+        while s["round"] < cfg.online.rounds:
+            self._round(s["round"] + 1)
 
-    def _round(self, rnd: int) -> bool:
-        """One online round; False when the critic warm-up ran out of rounds (the run stops and can be resumed).
-        Every decision here depends only on state that is identical on all ranks (gate result broadcast)."""
+    def _round(self, rnd: int) -> None:
+        """One online round. The actor flag decides which parameters get gradients, and the all-reduce must match
+        across ranks: it depends only on the round number."""
         cfg, s = self.cfg, self.state
-        warmup = self.action_mode and not s["actor_on"]
-        if warmup and rnd > cfg.actor.max_warmup_rounds:
-            log.warning(f"Stopping: the action gate did not pass in actor.max_warmup_rounds={cfg.actor.max_warmup_rounds}"
-                        f" rounds (needs gate/q_action_diff >= {cfg.actor.gate_q_diff} and gate/action_skill > "
-                        f"{cfg.actor.gate_min_skill}; see gate/* in metrics.jsonl). "
-                        f"Resume with a larger actor.max_warmup_rounds to keep warming up the critic.")
-            return False
+        warmup = self.action_mode and rnd <= cfg.actor.warmup_rounds
+        s["actor_on"] = self.action_mode and not warmup
         start = time.perf_counter()
         if cfg.online.reinit_each_round:
             self._load(self.run_dir / "stage2.pt", full=False)
         explore = self.agent.explore_std() if self.action_mode else None
-        self.collect(self.remaining(self._round_targets(rnd), stage=3, rnd=rnd), stage=3, rnd=rnd, online=True,
+        per_task = [cfg.online.episodes_per_task] * len(self.tasks)
+        self.collect(self.remaining(per_task, stage=3, rnd=rnd), stage=3, rnd=rnd, online=True,
                      use_residual=True, use_edit=True, explore_std=explore)
         self.train(cfg.online.updates_per_round, cfg.online.offline_ratio, stage_ckpt=False)
         s["round"] = rnd
-        gate = self._broadcast(self.gate())
-        if warmup:
-            self._warmup_decision(rnd, gate)
+        self.gate()
         final = rnd == cfg.online.rounds
         # While the actor is zero the policy is π0.5 itself: one eval (an in-process determinism check: it must
         # match the baseline exactly) is enough.
@@ -695,20 +690,6 @@ class Trainer:
                 self._save("best.pt")
         self._log_round(rnd, time.perf_counter() - start)
         self._save("last.pt")
-        return True
-
-    def _warmup_decision(self, rnd: int, gate: dict | None) -> None:
-        """Every rank gets the same gate dict and flips together: the actor flag decides which parameters get
-        gradients, and the all-reduce must match across ranks."""
-        gate, cfg = gate or {}, self.cfg.actor
-        values = (f"gate/q_action_diff {gate.get('gate/q_action_diff')} (needs >= {cfg.gate_q_diff}), "
-                  f"gate/action_skill {gate.get('gate/action_skill')} (needs > {cfg.gate_min_skill})")
-        if self.agent.gate_passed(gate):
-            self.state["actor_on"] = True
-            log.info(f"Round {rnd}: action gate passed: {values}; actor updates start next round")
-        else:
-            log.info(f"Round {rnd}: critic warm-up, {values}"
-                     + ("" if "gate/q_action_diff" in gate else " (no held-out online episode yet)"))
 
     def run_eval(self) -> None:
         """mode=eval: π0.5 baseline on items without a stored outcome, then policy.residual_ckpt and each
@@ -725,12 +706,6 @@ class Trainer:
                 outcomes = self.evaluate(self.eval_items(init_set, per_task), tag=tag, use_residual=False,
                                          explore_std=self.agent.explore_std(bound))
                 self._paired_report(tag, outcomes)
-
-    def _round_targets(self, rnd: int) -> list[int]:
-        """Split online.episodes_per_round over the tasks; the remainder rotates so every task gets equal data."""
-        n, per_round = len(self.tasks), self.cfg.online.episodes_per_round
-        base, extra = divmod(per_round, n)
-        return [base + int((i - rnd * extra) % n < extra) for i in range(n)]
 
     def _log_round(self, rnd: int, wall: float) -> None:
         if self.rank > 0:

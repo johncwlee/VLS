@@ -84,7 +84,7 @@ class ReplayBuffer:
         length = len(chunks["a_exec"])
         if self.size + length > self.capacity:
             # ponytail: no ring overwrite (protected data must survive); raise capacity if a run outgrows it
-            raise RuntimeError(f"Replay buffer full ({self.capacity} chunks); raise train.buffer_capacity")
+            raise RuntimeError(f"Replay buffer full ({self.capacity} chunks); raise train.buffer_capacity_per_task")
         rows = slice(self.size, self.size + length)
         for k, arr in chunks.items():
             self.data[k][rows] = arr
