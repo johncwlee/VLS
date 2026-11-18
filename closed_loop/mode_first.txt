@@ -1,0 +1,7 @@
+%% >>> NEW (closed-loop): this whole file is new; VLS had no per-call job text. Lines starting with %% are not sent.
+## Your job now: make the plan
+This is the first call in this episode. The robot may already be partway through the task, so some steps may already be done.
+1. Look at the image. Decide which parts of the task are already done.
+2. Write a plan with only the stages that are still needed, numbered from 1.
+3. Set `verdict = plan` and `current_stage = 1`.
+4. Write the guidance function for stage 1 of your plan only (or set `guidance = no` if the policy needs no steering there).

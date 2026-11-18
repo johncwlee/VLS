@@ -1,0 +1,14 @@
+%% >>> NEW (closed-loop): this whole file is new; VLS's check was vlm_query/stage_template.txt, which only picked a
+%%     stage number and guidance yes/no. Lines starting with %% are not sent.
+%% The "no longer interacting with scene objects" part of `done` was added 2026-11-18 (case D: VLM said done while holding the bottle).
+## Your job now: check stage {current_stage}
+The robot has been working on stage {current_stage} of the current plan.
+1. Did stage {current_stage} finish correctly? Use the current image.
+2. Were any stages that finished earlier undone? Example: a grasped object was dropped, or a placed object moved.
+3. Pick one verdict:
+   - `continue`: stage {current_stage} has not finished, but it is still going the right way. Keep the same guidance. Do not write a function.
+   - `advance`: stage {current_stage} finished correctly and nothing was undone. Write the guidance function for the next stage.
+   - `replan`: something went wrong (stage {current_stage} failed, or an earlier stage was undone). List the completed and undone stages.
+     Write a new plan with only the stages that are still needed, numbered from 1, starting from what you see now.
+     Set `current_stage = 1` and write the guidance function for stage 1 of the new plan.
+   - `done`: the whole task is finished, and the robot is no longer interacting with scene objects. Set `current_stage = 0`. Do not write a function.

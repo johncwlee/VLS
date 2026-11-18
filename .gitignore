@@ -101,3 +101,9 @@ output/
 
 # Submodule checkouts, cloned by hand at the commits pinned in requirements.txt
 third_party/
+
+# Local project notes (not part of the shared repo)
+CLAUDE.md
+TODO.md
+LOG.md
+PLAN_closed_loop.md
