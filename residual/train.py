@@ -241,15 +241,14 @@ class Trainer:
             plan += [task] * max(0, target - have)
         return plan
 
-    def collect(self, plan: list[Task], *, stage: int, rnd: int, online: bool, use_residual: bool,
-                use_edit: bool, explore_std: torch.Tensor | None = None) -> None:
-        """Waves of one episode per rank. Rank r of a wave fills buffer slot len(episodes) + r with plan[done + r],
+    def collect(self, plan: list[Task], *, stage: int, rnd: int, online: bool) -> None:
+        """online: the policy (π0.5 + residual, with exploration noise in action_residual mode) into the online pool;
+        otherwise plain π0.5 into the protected pool. Waves of one episode per rank. Rank r of a wave fills buffer slot len(episodes) + r with plan[done + r],
         so slots, RNG keys and plan entries line up the same for any number of GPUs."""
         for done in range(0, len(plan), self.world):
             slot, mine = len(self.buffer.episodes) + self.rank, None
             if done + self.rank < len(plan):
-                mine = self._collect_episode(plan[done + self.rank], slot, online=online, use_residual=use_residual,
-                                             use_edit=use_edit, explore_std=explore_std)
+                mine = self._collect_episode(plan[done + self.rank], slot, online)
             results = self._gather(mine)
             if self.rank == 0:
                 for result in results:
@@ -262,9 +261,9 @@ class Trainer:
             if self.rank > 0:
                 self.buffer.reload()
 
-    def _collect_episode(self, task: Task, slot: int, *, online: bool, use_residual: bool, use_edit: bool,
-                         explore_std: torch.Tensor | None) -> dict:
+    def _collect_episode(self, task: Task, slot: int, online: bool) -> dict:
         cfg, errors = self.cfg, []
+        explore_std = self.agent.explore_std() if online and self.action_mode else None
         while True:
             # Per-episode RNG keyed on the buffer slot: a resumed run continues the sequence instead of replaying
             # the init ids, held-out draws and noise of episodes collected after the last checkpoint.
@@ -274,8 +273,8 @@ class Trainer:
             start = time.perf_counter()
             try:
                 ep = run_episode(self.adapter(task), self.pi05, self.agent, task_idx=task.index,
-                                 init_state=task.train_inits[init_id], t_max=task.t_max, use_residual=use_residual,
-                                 use_edit=use_edit, record_video=slot % cfg.logging.video_train_every_episodes == 0,
+                                 init_state=task.train_inits[init_id], t_max=task.t_max, use_residual=online,
+                                 record_video=slot % cfg.logging.video_train_every_episodes == 0,
                                  explore_std=explore_std)
             except Exception:  # an env failure drops this episode, not the run
                 errors.append({"suite": task.suite, "task": task.task_id, "init_id": init_id,
@@ -359,7 +358,7 @@ class Trainer:
     def _tag(name: str, init_set: str) -> str:
         return name if init_set == "official" else f"{name}_{init_set}"
 
-    def evaluate(self, items: list[tuple[int, str, int]], *, tag: str, use_residual: bool, use_edit: bool = True,
+    def evaluate(self, items: list[tuple[int, str, int]], *, tag: str, use_residual: bool,
                  explore_std: torch.Tensor | None = None) -> dict[str, bool]:
         """Seeded episodes on (task index, init set, init id) items, split over ranks; never added to the buffer.
         Returns {eval_key: success} on every rank (episodes that raised are left out)."""
@@ -367,7 +366,7 @@ class Trainer:
         mine, results = items[self.rank::self.world], []
         for k, (task_index, init_set, init_id) in enumerate(mine, 1):
             results.append(self._eval_episode(self.tasks[task_index], init_set, init_id, tag=tag,
-                                              use_residual=use_residual, use_edit=use_edit, explore_std=explore_std))
+                                              use_residual=use_residual, explore_std=explore_std))
             if self.rank == 0 and (k % PROGRESS_EVERY_EPISODES == 0 or k == len(mine)):
                 log.info(f"Eval [{tag}]: {k}/{len(mine)} episodes on rank 0 ({len(items)} over {self.world} GPU(s))")
         gathered = self._gather(results)
@@ -411,7 +410,7 @@ class Trainer:
                  f"per suite {per_suite} per task {[(t.label, round(float(np.mean(v)), 2)) for t, v in successes.items()]}")
         return outcomes
 
-    def _eval_episode(self, task: Task, init_set: str, init_id: int, *, tag: str, use_residual: bool, use_edit: bool,
+    def _eval_episode(self, task: Task, init_set: str, init_id: int, *, tag: str, use_residual: bool,
                       explore_std: torch.Tensor | None) -> dict:
         inits = task.official_inits if init_set == "official" else task.train_inits
         seed = self.cfg.eval.seed
@@ -420,7 +419,7 @@ class Trainer:
         try:
             ep = run_episode(self.adapter(task), self.pi05, self.agent, task_idx=task.index,
                              init_state=inits[init_id], t_max=task.t_max, use_residual=use_residual,
-                             use_edit=use_edit, record_video=init_id < self.cfg.logging.video_eval_per_task,
+                             record_video=init_id < self.cfg.logging.video_eval_per_task,
                              seed=eval_seed(seed, task, init_set, init_id), explore_std=explore_std)
         except Exception:
             log.exception(f"Eval episode failed ({task.label}, {init_set} init {init_id}); excluded")
@@ -441,7 +440,7 @@ class Trainer:
                      if eval_key(self.tasks[it[0]], it[1], it[2], self.cfg.eval.seed) not in self.state["baseline"]]
             if items:
                 self.state["baseline"].update(self.evaluate(items, tag=self._tag("baseline", init_set),
-                                                            use_residual=False, use_edit=False))
+                                                            use_residual=False))
                 self._save("last.pt")  # per set: a crash or job timeout keeps the finished sets
 
     def _evaluate_policy(self, per_task: int, zero_residual: bool = False) -> float:
@@ -510,15 +509,16 @@ class Trainer:
         return data, rtg, episodes, starts
 
     @torch.no_grad()
-    def gate(self) -> dict | None:
-        """Rank 0; returns the logged metrics (None on other ranks).
-        Spec §10 Stage 2 gate on held-out offline episodes: critic Q vs realized return-to-go. It passes a critic that
-        ignores actions, so the action gate on held-out online episodes (collected with exploration noise) asks
-        whether Q changes with the executed action: agent.action_metrics."""
+    def gate(self) -> None:
+        """Rank 0: gate/* diagnostics on held-out episodes; they are logged and decide nothing.
+        Offline episodes: critic Q vs realized return-to-go. A critic that ignores actions scores well there, so on
+        online episodes (collected with exploration noise) agent.action_metrics asks whether Q changes with the
+        executed action."""
         if self.rank > 0:
-            return None
+            return
         metrics, device = {}, self.cfg.device
-        # ponytail: whole held-out set in one batch (~10k rows max); chunk it if the gate runs out of GPU memory
+        # ponytail: whole held-out set in one batch (~27k rows by round 100 at the defaults); chunk it if the gate
+        # runs out of GPU memory
         offline = self._heldout(online=False)
         if offline is not None:
             data, rtg, episodes, starts = offline
@@ -538,16 +538,15 @@ class Trainer:
             metrics.update({k: float(v) for k, v in action.items()})
         if metrics:
             self.monitor.log(metrics, **self.axes())
-        return metrics
 
     # ---------------------------------------------------------------- updates
     def _stored_context(self, rows: dict) -> Context:
-        """Critic / actor inputs from stored buffer fields, without a π0.5 pass (a_base only if it was read)."""
+        """Critic / actor inputs from stored buffer fields, without a π0.5 pass."""
         device = self.cfg.device
         return Context(h_prefix=torch.from_numpy(rows["h_prefix"]).float().to(device),
                        state=torch.from_numpy(rows["state_norm"]).to(device),
                        progress=torch.from_numpy(rows["step"] / self.t_max_by_task[rows["task"]]).float().to(device),
-                       base=None, a_base=torch.from_numpy(rows["a_base"]).to(device) if "a_base" in rows else None)
+                       base=None, a_base=torch.from_numpy(rows["a_base"]).to(device))
 
     def _fit_feat_stats(self) -> None:
         """Standardize critic / actor features with the offline pool's statistics; rank 0 computes, all ranks get
@@ -555,7 +554,7 @@ class Trainer:
         if self.rank == 0:
             idx = self.buffer.protected_idx
             if len(idx):
-                rows = self.buffer.get(idx, ["h_prefix", "state_norm", "task", "step"])
+                rows = self.buffer.get(idx, STORED_CTX_KEYS)
                 self.agent.fit_feat_stats(self.agent.raw_feat(self._stored_context(rows)))
                 log.info(f"Critic features standardized with {len(idx)} offline chunks")
             else:
@@ -599,8 +598,7 @@ class Trainer:
                                                next_ctx, actor=self.state["actor_on"])
             self.state["update_step"] += 1
             step = self.state["update_step"]
-            if cfg.logging.nan_guard:
-                self._nan_guard(info, idx, next_idx)
+            self._nan_guard(info, idx, next_idx)
             if self.rank > 0:  # info is already averaged over ranks; rank 0 logs and checkpoints
                 continue
             self._log_update(window, info, hist, idx, reward, rows["terminal"])
@@ -627,7 +625,7 @@ class Trainer:
             metrics.update({f"update/time/{k}": t / cfg.logging.log_every_updates for k, t in self.timer.pop().items()})
             metrics.update({"update/time/gpu_mem_peak_gb": torch.cuda.max_memory_allocated() / 2 ** 30,
                             "buffer/protected_chunks": len(self.buffer.protected_idx),
-                            "buffer/online_chunks": len(self.buffer.online_idx), "update/lr": cfg.qam.lr})
+                            "buffer/online_chunks": len(self.buffer.online_idx)})
             torch.cuda.reset_peak_memory_stats()
             self.monitor.log(metrics, **self.axes())
             window.clear()
@@ -660,7 +658,7 @@ class Trainer:
                 self.import_expert()
             elif cfg.offline.source == "pi05":
                 plan = self.remaining([cfg.offline.episodes_per_task] * len(self.tasks), stage=1, rnd=0)
-                self.collect(plan, stage=1, rnd=0, online=False, use_residual=False, use_edit=False)
+                self.collect(plan, stage=1, rnd=0, online=False)
             else:
                 raise SystemExit(f"offline.source must be 'pi05' or 'vls', got {cfg.offline.source!r}")
             self._fit_feat_stats()
@@ -686,10 +684,8 @@ class Trainer:
         start = time.perf_counter()
         if cfg.online.reinit_each_round:
             self._load(self.run_dir / "stage2.pt", full=False)
-        explore = self.agent.explore_std() if self.action_mode else None
         per_task = [cfg.online.episodes_per_task] * len(self.tasks)
-        self.collect(self.remaining(per_task, stage=3, rnd=rnd), stage=3, rnd=rnd, online=True,
-                     use_residual=True, use_edit=True, explore_std=explore)
+        self.collect(self.remaining(per_task, stage=3, rnd=rnd), stage=3, rnd=rnd, online=True)
         self.train(cfg.online.updates_per_round, cfg.online.offline_ratio, stage_ckpt=False)
         self.gate()
         final = rnd == cfg.online.rounds

@@ -24,7 +24,7 @@ import contextlib
 import copy
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -153,21 +153,20 @@ class QAMEAgent(nn.Module):
     def _pad(self, v_phi: Tensor) -> Tensor:
         return F.pad(v_phi, (0, self.dims.pad_dim - self.dims.action_dim))
 
-    def critic_feat(self, ctx: Context, action: Tensor, a_base: Tensor | None = None) -> Tensor:
-        """The critic's non-action input. action_residual appends the residual (action - a_base) / s, the only part
-        of the action that exploration and the actor vary (unit scale under exploration, exactly zero on π0.5's own
-        chunks): inside `action` it is a 0.4-std offset on top of a_base, which the critic cannot see separately.
-        a_base defaults to the stored ctx.a_base. Differentiable in `action`."""
+    def critic_feat(self, ctx: Context, action: Tensor) -> Tensor:
+        """The critic's non-action input. action_residual appends the residual (action - ctx.a_base) / s, the only
+        part of the action that exploration and the actor vary (unit scale under exploration, exactly zero on π0.5's
+        own chunks): inside `action` it is an s-sized offset on top of a_base, which the critic cannot see
+        separately. Differentiable in `action`."""
         feat = self.feat(ctx)
         if self.actor is None:
             return feat
         bound = self.actor.bound
-        residual = (action - (ctx.a_base if a_base is None else a_base)) / torch.where(bound > 0, bound, 1.0)
+        residual = (action - ctx.a_base) / torch.where(bound > 0, bound, 1.0)
         return torch.cat([feat, residual.flatten(1)], dim=-1)
 
-    def pessimistic_q(self, ctx: Context, action: Tensor, target: bool = False, a_base: Tensor | None = None
-                      ) -> Tensor:
-        qs = (self.target_critic if target else self.critic)(self.critic_feat(ctx, action, a_base), action)
+    def pessimistic_q(self, ctx: Context, action: Tensor, target: bool = False) -> Tensor:
+        qs = (self.target_critic if target else self.critic)(self.critic_feat(ctx, action), action)
         return qs.mean(0) - self.cfg.qam.rho * qs.std(0, unbiased=False)
 
     # ---------------------------------------------------------------- sampling (openpi convention)
@@ -205,17 +204,17 @@ class QAMEAgent(nn.Module):
         return x[:bsize], stats
 
     @torch.no_grad()
-    def act(self, ctx: Context, noise: Tensor, use_residual: bool = True, use_edit: bool = True,
-            with_base: bool = False, explore_std: Tensor | None = None,
-            generator: torch.Generator | None = None) -> dict:
+    def act(self, ctx: Context, noise: Tensor, use_residual: bool = True, with_base: bool = False,
+            explore_std: Tensor | None = None, generator: torch.Generator | None = None) -> dict:
         """Executed chunk [B, n_exec, A] (normalized, clipped), plus diagnostics and the same-noise base chunk.
-        use_residual applies the learned correction (velocity residual, or the action residual); use_edit is
-        QAM-E's edit and has no effect in action_residual mode. explore_std [A] adds one Gaussian offset per action
+        use_residual applies the learned policy (the action residual, or the velocity residual and QAM-E's edit);
+        without it the chunk is π0.5's. explore_std [A] adds one Gaussian offset per action
         dim, held over the chunk (collection and the exploration probe; noise drawn per step would largely cancel
         within a chunk), drawn from `generator` when given (seeded evaluation)."""
         if self.actor is not None:
             x0, stats = self.sample_chunk(ctx, noise, use_residual=False)
             a_base = self.clip(self.exec_slice(x0))
+            ctx = replace(ctx, a_base=a_base)
             out = {"latent": stats["latent"], "ratio": None, "sat": None, "edit": None, "a_base": a_base}
             a = a_base
             if use_residual:
@@ -224,13 +223,14 @@ class QAMEAgent(nn.Module):
             if explore_std is not None:
                 a = a + torch.randn(a.shape[0], 1, a.shape[-1], device=a.device, generator=generator) * explore_std
             out["a_exec"] = a = self.clip(a)
-            out["q"] = self.pessimistic_q(ctx, a, a_base=a_base)
+            out["q"] = self.pessimistic_q(ctx, a)
             return out
+        use_edit = use_residual and self.edit is not None
         use_residual = use_residual and self.cfg.qam.inv_temp > 0  # QAM: inv_temp == 0 samples the base only
         x0, stats = self.sample_chunk(ctx, noise, use_residual, with_base=with_base and use_residual)
         a = self.clip(self.exec_slice(x0))
         out = {"latent": stats["latent"], "ratio": stats.get("ratio"), "sat": stats.get("sat"), "edit": None}
-        if use_edit and self.edit is not None:
+        if use_edit:
             edit, _ = self.edit(self.feat(ctx), a, generator)
             out["edit"] = self.cfg.edit.scale * edit
             a = self.clip(a + out["edit"])

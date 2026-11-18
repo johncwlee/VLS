@@ -78,7 +78,7 @@ class Episode:
 
 
 def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_state: np.ndarray, t_max: int,
-                use_residual: bool, use_edit: bool, record_video: bool = False, seed: int | None = None,
+                use_residual: bool, record_video: bool = False, seed: int | None = None,
                 explore_std: torch.Tensor | None = None) -> Episode:
     """seed (evaluation) fixes the scene and π0.5's noise: LIBERO re-draws fixture poses (cabinets, stoves) from
     np.random at every reset, which set_init_state does not restore, and π0.5's flow noise (then any exploration
@@ -96,7 +96,7 @@ def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_st
         batch = pi05.preprocess(image, image2, state, obs["task"])
         ctx = pi05.context(batch, torch.tensor([chunk / t_max]))
         noise = agent.noise(ctx, generator)
-        out = agent.act(ctx, noise, use_residual=use_residual, use_edit=use_edit, with_base=True,
+        out = agent.act(ctx, noise, use_residual=use_residual, with_base=True,
                         explore_std=explore_std, generator=generator)
         raw = pi05.unnormalize(out["a_exec"])[0]
         policy_time += time.perf_counter() - start

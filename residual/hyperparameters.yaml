@@ -158,7 +158,6 @@ logging:
   hist_every_updates: 1000
   video_eval_per_task: 4      # first N eval episodes per task (successes and failures)
   video_train_every_episodes: 50
-  nan_guard: true             # on NaN/inf in any update metric: dump batch indices + agent state to debug/ and stop
   wandb:
     mode: online              # online | offline (sync later with `wandb sync`) | disabled
     project: residual-qam-e
