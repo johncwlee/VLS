@@ -1,7 +1,7 @@
 """Training monitor: metrics.jsonl / episodes.jsonl in the run dir always, wandb when enabled.
 
-Every scalar row carries its step axes (update_step, env_step, round, stage, chunks) so the jsonl alone is enough for
-`python -m residual.plot_run <run_dir>`, and wandb plots each metric group against the right axis.
+Every scalar row carries its step axes (update_step, env_step, round, stage, chunks) so the jsonl alone is enough to
+plot a run, and wandb plots each metric group against the right axis.
 """
 
 import contextlib
