@@ -231,7 +231,7 @@ class QAMEAgent(nn.Module):
         a = self.clip(self.exec_slice(x0))
         out = {"latent": stats["latent"], "ratio": stats.get("ratio"), "sat": stats.get("sat"), "edit": None}
         if use_edit and self.edit is not None:
-            edit, _ = self.edit(self.feat(ctx), a)
+            edit, _ = self.edit(self.feat(ctx), a, generator)
             out["edit"] = self.cfg.edit.scale * edit
             a = self.clip(a + out["edit"])
         out["a_exec"] = a

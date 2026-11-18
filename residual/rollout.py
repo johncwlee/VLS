@@ -35,7 +35,8 @@ def task_specs(env_cfg) -> list[tuple[str, int]]:
     suite = f"{base}_{env.perturbation}"; tasks are env.task_ids_by_suite[base] if given, else env.task_ids."""
     specs = []
     for base in env_cfg.suites:
-        ids = env_cfg.task_ids_by_suite.get(base) or env_cfg.task_ids
+        ids = env_cfg.task_ids_by_suite.get(base)
+        ids = env_cfg.task_ids if ids is None else ids  # [] excludes the suite
         specs += [(f"{base}_{env_cfg.perturbation}", int(t)) for t in ids]
     return specs
 

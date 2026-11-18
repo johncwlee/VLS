@@ -58,8 +58,8 @@ class ReplayBuffer:
         self.layout = {k: [d, list(s)] for k, (d, s) in specs.items()}  # as stored in meta.json
         if resume:
             meta = json.loads(self.meta_path.read_text())
-            if meta["capacity"] != capacity or meta["specs"] != self.layout:
-                raise ValueError(f"Buffer at {self.dir} was created with a different capacity or layout")
+            if meta["capacity"] > capacity or meta["specs"] != self.layout:  # a larger capacity extends the files
+                raise ValueError(f"Buffer at {self.dir} was created with a larger capacity or another layout")
         self.data = {k: np.memmap(self.dir / f"{k}.bin", dtype=d, mode="r" if readonly else "r+" if resume else "w+",
                                   shape=(capacity, *s)) for k, (d, s) in specs.items()}
         if resume:

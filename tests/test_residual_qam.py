@@ -133,7 +133,8 @@ def test_chunk_reward():
 
 
 def test_buffer_resume_and_readonly_view(tmp_path):
-    """A reopened buffer (resume, or a rank > 0 view) sees the same episodes and pools; a layout change is refused."""
+    """A reopened buffer (resume, or a rank > 0 view) sees the same episodes and pools; a smaller capacity or another
+    layout is refused."""
     specs = field_specs((3, 4, 4), DIMS)
     buf = ReplayBuffer(tmp_path, 20, specs)
     view = ReplayBuffer(tmp_path, 20, specs, readonly=True)
@@ -148,7 +149,12 @@ def test_buffer_resume_and_readonly_view(tmp_path):
         np.testing.assert_array_equal(other.online_idx, [3, 4, 5])
         np.testing.assert_array_equal(other.get(np.array([5, 0]), ["terminal"])["terminal"], [True, False])
     with pytest.raises(ValueError):
-        ReplayBuffer(tmp_path, 21, specs)
+        ReplayBuffer(tmp_path, 19, specs)
+    with pytest.raises(ValueError):
+        ReplayBuffer(tmp_path, 20, field_specs((3, 5, 5), DIMS))
+    grown = ReplayBuffer(tmp_path, 30, specs)  # a full buffer can be resumed with a larger capacity
+    grown.add_episode(chunks, {"task": 0}, online=True, heldout=False)
+    assert grown.size == 9 and grown.data["terminal"][8] and grown.data["terminal"][2]
 
 
 def test_non_finite_update_does_not_step():
@@ -393,3 +399,48 @@ def test_paired_stats():
     same = paired_stats({"a": True, "b": False}, {"a": True, "b": False})
     assert same["paired_se"] == 0 and "paired_z" not in same and same["flip_frac"] == 0
     assert paired_stats(policy, {}) == {}
+
+
+def test_critic_target_value():
+    """target = r + discount * mask * (mean - rho * std) of the target critic at the policy's action in s'."""
+    torch.manual_seed(0)
+    agent = make_agent("action_residual")
+    nn.init.normal_(agent.actor.out.weight, std=1.0)
+    for p in agent.target_critic.parameters():  # unlike the online critic
+        nn.init.normal_(p, std=0.3)
+    ctx, nxt = with_base(context(8), torch.randn(8, 1, 2)), with_base(context(8), torch.randn(8, 1, 2))
+    reward, mask = -torch.rand(8), torch.tensor([1.0, 0, 1, 1, 0, 1, 1, 0])
+    info = agent.critic_loss(ctx, torch.randn(8, 1, 2), reward, mask, nxt)[1]
+    with torch.no_grad():
+        next_action = agent.policy_action(nxt)
+        qs = agent.target_critic(agent.critic_feat(nxt, next_action), next_action)
+        expected = reward + agent.cfg.qam.discount * mask * (qs.mean(0) - agent.cfg.qam.rho * qs.std(0, unbiased=False))
+    torch.testing.assert_close(info["update/critic/target_mean"], expected.mean())
+
+
+def test_actor_loss_gives_the_critic_no_gradient():
+    agent = make_agent("action_residual")
+    loss, _, _ = agent.actor_loss(with_base(context(8), torch.randn(8, 1, 2)))
+    loss.backward()
+    assert all(p.grad is None for p in agent.critic.parameters())
+    assert agent.actor.out.weight.grad.abs().sum() > 0
+
+
+def test_heldout_episodes_are_never_sampled_and_terminal_rows_have_no_successor(tmp_path):
+    buf = ReplayBuffer(tmp_path, 20, field_specs((3, 4, 4), DIMS))
+    chunks = {"a_exec": np.ones((3, DIMS.exec_horizon, DIMS.action_dim), np.float32), "steered": np.zeros(3, bool),
+              "terminal": np.array([False, False, True]), "success": np.array([False, False, True])}
+    for online, heldout in ((False, False), (False, True), (True, False), (True, True)):
+        buf.add_episode(chunks, {"task": 0}, online=online, heldout=heldout)
+    np.testing.assert_array_equal(buf.protected_idx, [0, 1, 2])
+    np.testing.assert_array_equal(buf.online_idx, [6, 7, 8])
+    idx = buf.sample(200, 0.5, np.random.default_rng(0))
+    assert set(idx) <= {0, 1, 2, 6, 7, 8}
+    np.testing.assert_array_equal(buf.next_index(np.array([0, 1, 2, 6, 8])), [1, 2, 2, 7, 8])
+
+
+def test_task_specs_per_suite_ids():
+    from residual.rollout import task_specs
+    env = OmegaConf.create({"suites": ["a", "b", "c"], "perturbation": "task", "task_ids": [0, 1],
+                            "task_ids_by_suite": {"a": None, "b": [5], "c": []}})
+    assert task_specs(env) == [("a_task", 0), ("a_task", 1), ("b_task", 5)]  # an empty list excludes the suite

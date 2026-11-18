@@ -126,12 +126,13 @@ class EditActor(nn.Module):
             nn.init.zeros_(layer.bias)
         self.log_alpha = nn.Parameter(torch.tensor(math.log(cfg.init_alpha)))
 
-    def forward(self, feat: Tensor, chunk: Tensor) -> tuple[Tensor, Tensor]:
-        """Returns (edit in [-1, 1] with chunk's shape, log-prob [B]) for a reparameterized sample."""
+    def forward(self, feat: Tensor, chunk: Tensor, generator: torch.Generator | None = None) -> tuple[Tensor, Tensor]:
+        """Returns (edit in [-1, 1] with chunk's shape, log-prob [B]) for a reparameterized sample, drawn from
+        `generator` when given (seeded evaluation)."""
         h = self.trunk(torch.cat([feat, chunk.flatten(1)], dim=-1))
         mean = self.mean(h)
         std = self.log_std(h).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX).exp()
-        u = mean + std * torch.randn_like(mean)
+        u = mean + std * torch.randn(mean.shape, device=mean.device, dtype=mean.dtype, generator=generator)
         log_prob = torch.distributions.Normal(mean, std).log_prob(u).sum(-1)
         log_prob = log_prob - (2.0 * (math.log(2.0) - u - F.softplus(-2.0 * u))).sum(-1)  # tanh Jacobian
         return torch.tanh(u).view_as(chunk), log_prob

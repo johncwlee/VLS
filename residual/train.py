@@ -96,6 +96,9 @@ class Trainer:
             raise SystemExit(f"eval.init_sets: unknown {sorted(unknown)}; expected a subset of {list(INIT_SETS)}")
         if cfg.mode not in ("train", "eval"):
             raise SystemExit(f"mode={cfg.mode!r}; expected train or eval")
+        if cfg.mode == "train" and cfg.policy.residual_ckpt:  # training refits the feature statistics the weights need
+            raise SystemExit("policy.residual_ckpt is for mode=eval; continue a run with train.resume_dir, reuse "
+                             "baseline outcomes with eval.baseline_ckpt")
         self.cpu_group = dist.new_group(backend="gloo", timeout=DIST_TIMEOUT) if self.world > 1 else None
         self.pi05 = Pi05(cfg.policy.pretrained_path, cfg.device)
         self.dims = self.pi05.dims(cfg.policy.exec_horizon, cfg.policy.num_inference_steps)
@@ -197,7 +200,9 @@ class Trainer:
         self.agent.load_state_dict(payload["agent"])
         self.agent.load_optim_state_dict(payload["optim"])
         if full:
-            self.state.update(payload["state"])  # keys added since the checkpoint keep their defaults
+            # keys added since the checkpoint keep their defaults; baseline outcomes from eval.baseline_ckpt stay
+            baseline = {**self.state["baseline"], **payload["state"].get("baseline", {})}
+            self.state.update(payload["state"], baseline=baseline)
             self.rng.bit_generator.state = payload["rng"]["numpy"]
             random.setstate(payload["rng"]["python"])
             torch.set_rng_state(payload["rng"]["torch"])
@@ -390,7 +395,7 @@ class Trainer:
             if r["video"] is not None:
                 self.monitor.video(r["video"], **self.axes())
         overall = float(np.mean([s for v in successes.values() for s in v])) if successes else 0.0
-        metrics = {f"eval/{tag}/success": overall}
+        metrics = {f"eval/{tag}/success": overall, f"eval/{tag}/errors": len(results) - len(outcomes)}
         by_suite = defaultdict(list)
         for task, task_successes in successes.items():
             metrics[f"eval/{tag}/success_{task.label}"] = float(np.mean(task_successes))
@@ -439,19 +444,23 @@ class Trainer:
                                                             use_residual=False, use_edit=False))
                 self._save("last.pt")  # per set: a crash or job timeout keeps the finished sets
 
-    def _evaluate_policy(self, per_task: int) -> float:
-        """The current policy on every init set, paired with the baseline; returns success on the official set."""
+    def _evaluate_policy(self, per_task: int, zero_residual: bool = False) -> float:
+        """The current policy on every init set, paired with the baseline. Returns the success that selects best.pt:
+        on the train inits when they are evaluated (the official inits are the test set), over the inits every
+        evaluation shares (the final one runs more)."""
         success = None
         for init_set in self.cfg.eval.init_sets:
             tag = self._tag("policy", init_set)
             outcomes = self.evaluate(self.eval_items(init_set, per_task), tag=tag, use_residual=True)
-            self._paired_report(tag, outcomes)
-            if init_set == "official" or success is None:
-                success = float(np.mean(list(outcomes.values()))) if outcomes else 0.0
+            self._paired_report(tag, outcomes, zero_residual)
+            if init_set == "train" or success is None:
+                shared = [v for k, v in outcomes.items() if int(k.split("/")[3]) < self.cfg.eval.episodes_per_task]
+                success = float(np.mean(shared)) if shared else 0.0
         return success
 
-    def _paired_report(self, tag: str, outcomes: dict[str, bool]) -> None:
-        """Rank 0: paired difference from the baseline, overall and per task -> metrics and eval_summary.json."""
+    def _paired_report(self, tag: str, outcomes: dict[str, bool], zero_residual: bool = False) -> None:
+        """Rank 0: paired difference from the baseline, overall and per task -> metrics and eval_summary.json.
+        zero_residual: the policy is π0.5 itself, so any flipped outcome is noise in the pairing."""
         if self.rank > 0:
             return
         overall = paired_stats(outcomes, self.state["baseline"])
@@ -470,6 +479,10 @@ class Trainer:
         log.info(f"Eval [{tag}] vs baseline over {overall['paired_n']} paired episodes: success "
                  f"{overall['success']:.3f} vs {overall['baseline_success']:.3f}, diff {overall['paired_diff']:+.3f} "
                  f"± {overall['paired_se']:.3f} (SE), flipped {overall['flip_frac']:.3f}")
+        if zero_residual and overall["flip_frac"] > 0:
+            log.warning(f"Eval [{tag}]: the zero residual differs from the stored baseline on {overall['flip_frac']:.1%} "
+                        f"of episodes. The baseline was not produced under this run's conditions (another machine, "
+                        f"code version or eval.baseline_ckpt), so every paired difference carries that noise")
         summary = json.loads(self.eval_summary_path.read_text()) if self.eval_summary_path.exists() else {}
         summary[f"{tag}_round{self.state['round']}"] = {**overall, "per_task": per_task}
         tmp = self.eval_summary_path.with_suffix(".tmp")
@@ -640,9 +653,9 @@ class Trainer:
             self.run_eval()
             return
         cfg, s = self.cfg, self.state
+        if cfg.eval.baseline_at_start:  # also on resume: only items without a stored outcome are run
+            self._ensure_baseline(cfg.eval.final_episodes_per_task)
         if s["stage"] == 1:
-            if cfg.eval.baseline_at_start:
-                self._ensure_baseline(cfg.eval.final_episodes_per_task)
             if cfg.offline.source == "vls":
                 self.import_expert()
             elif cfg.offline.source == "pi05":
@@ -667,6 +680,7 @@ class Trainer:
         """One online round. The actor flag decides which parameters get gradients, and the all-reduce must match
         across ranks: it depends only on the round number."""
         cfg, s = self.cfg, self.state
+        s["round"] = rnd  # for the logged axes; saved only with best.pt / last.pt below
         warmup = self.action_mode and rnd <= cfg.actor.warmup_rounds
         s["actor_on"] = self.action_mode and not warmup
         start = time.perf_counter()
@@ -677,14 +691,14 @@ class Trainer:
         self.collect(self.remaining(per_task, stage=3, rnd=rnd), stage=3, rnd=rnd, online=True,
                      use_residual=True, use_edit=True, explore_std=explore)
         self.train(cfg.online.updates_per_round, cfg.online.offline_ratio, stage_ckpt=False)
-        s["round"] = rnd
         self.gate()
         final = rnd == cfg.online.rounds
-        # While the actor is zero the policy is π0.5 itself: one eval (an in-process determinism check: it must
-        # match the baseline exactly) is enough.
+        # While the actor is zero the policy is π0.5 itself: one eval is enough. It checks the pairing: it matches
+        # a baseline from this run episode for episode (_paired_report warns if not).
         if (rnd % cfg.eval.every_rounds == 0 or final) and not (warmup and s["warmup_eval_done"]):
             s["warmup_eval_done"] |= warmup
-            success = self._evaluate_policy(cfg.eval.final_episodes_per_task if final else cfg.eval.episodes_per_task)
+            success = self._evaluate_policy(cfg.eval.final_episodes_per_task if final else cfg.eval.episodes_per_task,
+                                            zero_residual=warmup)
             if success > s["best_eval"]:
                 s["best_eval"] = success
                 self._save("best.pt")
