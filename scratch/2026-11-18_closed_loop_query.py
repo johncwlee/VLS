@@ -136,8 +136,14 @@ if __name__ == '__main__':
     # Case B: nothing has happened yet (frame 0), checked on a stage time limit
     prompt_b = check_prompt(meta3, task3, plan3, 1, 1, hist3, 'stage 1 time limit reached (4 chunks)', 'open')  # frame 0: Grip:O
     report('B. nothing happened yet (episode 3, frame 0)', 'stage 1 time limit reached (4 chunks)',
-           'verdict=continue, stage=1, no function. Wrong: advance or done',
+           'verdict=replan (time ran out and the arm has not moved), stage=1, function aims at bottle. Wrong: continue, advance, done',
            f'{out_root}/B_nothing_happened', prompt_b, [start3, video_frame(3, 'success', 0)])
+
+    # Case B2: same trigger, but the open gripper has moved down to just above the bottle neck (frame 15)
+    prompt_b2 = check_prompt(meta3, task3, plan3, 1, 1, hist3, 'stage 1 time limit reached (4 chunks)', 'open')  # frame 15: Grip:O
+    report('B2. progressing, not grasped yet (episode 3, frame 15)', 'stage 1 time limit reached (4 chunks)',
+           'verdict=continue, stage=1, no function. Wrong: replan, advance, done',
+           f'{out_root}/B2_progressing', prompt_b2, [start3, video_frame(3, 'success', 15)])
 
     # Case C: bottle grasped and lifted (frame 40)
     prompt_c = check_prompt(meta3, task3, plan3, 1, 1, hist3, 'gripper closed', 'closed')  # frame 40: Grip:C
