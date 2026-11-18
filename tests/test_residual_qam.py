@@ -277,6 +277,13 @@ def test_exploration_offset_is_held_over_the_chunk():
     assert offset[:, 0, 0].std().item() == pytest.approx(0.5 * S, rel=0.05)  # explore.std_frac * s
     assert not torch.allclose(offset, again)  # fresh offset per chunk
     assert torch.equal(agent.act(ctx, noise)["a_exec"], plain)  # off unless asked
+    per_step = make_agent("action_residual", dims=dims, explore={"mode": "step"})
+    offset = per_step.act(ctx, noise, explore_std=per_step.explore_std())["a_exec"] - plain
+    assert offset[..., -1].abs().max() == 0  # gripper
+    assert offset[..., 0].std().item() == pytest.approx(0.5 * S, rel=0.05)
+    assert abs(torch.corrcoef(offset[..., 0].T)[0, 1].item()) < 0.05  # independent across the chunk's steps
+    with pytest.raises(ValueError, match="explore.mode"):
+        make_agent("action_residual", explore={"mode": "both"})
 
 
 def test_actor_climbs_a_linear_critic_to_its_bound():

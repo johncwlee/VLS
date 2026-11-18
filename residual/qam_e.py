@@ -37,6 +37,7 @@ from residual.networks import ActionResidual, CriticEnsemble, EditActor, Residua
 # (base state, x [B, H, D], t [B]) -> (velocity [B, H, D], action-expert hidden [B, H, D_ae]), openpi convention
 BaseFn = Callable[[Any, Tensor, Tensor], tuple[Tensor, Tensor]]
 MODES = ("action_residual", "qam_velocity")
+EXPLORE_MODES = ("chunk", "step")
 FEAT_STD_FLOOR = 1e-3  # critic/actor feature standardization; the smallest h_prefix dim std measured is 0.056
 
 
@@ -82,6 +83,8 @@ class QAMEAgent(nn.Module):
         self.register_buffer("action_high", action_high.float())
         if cfg.actor.mode not in MODES:
             raise ValueError(f"actor.mode={cfg.actor.mode!r}; expected one of {MODES}")
+        if cfg.explore.mode not in EXPLORE_MODES:
+            raise ValueError(f"explore.mode={cfg.explore.mode!r}; expected one of {EXPLORE_MODES}")
         exec_dim = dims.exec_horizon * dims.action_dim
         self.feat_dim = dims.prefix_dim + dims.state_dim + int(cfg.critic.time_feature)
         # feature standardization, fitted once on the offline pool (fit_feat_stats); identity until then
@@ -200,8 +203,8 @@ class QAMEAgent(nn.Module):
             explore_std: Tensor | None = None, generator: torch.Generator | None = None) -> dict:
         """Executed chunk [B, n_exec, A] (normalized, clipped), plus diagnostics and the same-noise base chunk.
         use_residual applies the learned policy (the action residual, or the velocity residual and QAM-E's edit);
-        without it the chunk is π0.5's. explore_std [A] adds one Gaussian offset per action
-        dim, held over the chunk (collection only; noise drawn per step would largely cancel within a chunk).
+        without it the chunk is π0.5's. explore_std [A] adds Gaussian exploration noise (collection only):
+        explore.mode=chunk draws one offset per action dim and holds it over the chunk, step draws one per step.
         `generator` seeds QAM-E's edit sample (seeded evaluation)."""
         if self.actor is not None:
             x0, _ = self.sample_chunk(ctx, noise, use_residual=False)
@@ -213,7 +216,8 @@ class QAMEAgent(nn.Module):
                 out["edit"] = self.actor(self.feat(ctx), a_base)
                 a = a + out["edit"]
             if explore_std is not None:
-                a = a + torch.randn(a.shape[0], 1, a.shape[-1], device=a.device) * explore_std
+                steps = a.shape[1] if self.cfg.explore.mode == "step" else 1  # 1: broadcast over the chunk
+                a = a + torch.randn(a.shape[0], steps, a.shape[-1], device=a.device) * explore_std
             out["a_exec"] = a = self.clip(a)
             out["q"] = self.pessimistic_q(ctx, a)
             return out

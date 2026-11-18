@@ -26,7 +26,11 @@ actor:                        # which steering policy is trained
                               # 10-task run. gate/* is still logged
 
 explore:                      # collection only (never at evaluation or in the critic target)
-  std_frac: 1.0               # one N(0, (std_frac * s)^2) offset per action dim per chunk, held over its steps.
+  mode: chunk                 # chunk: one offset per action dim, held over the chunk's steps (6 random directions;
+                              #   every run so far). step: an independent offset at every step (60 directions, as
+                              #   many as the actor can move). Step noise partly cancels within a chunk: the net
+                              #   displacement is ~sqrt(exec_horizon) x std instead of exec_horizon x std (untested)
+  std_frac: 1.0               # each offset is N(0, (std_frac * s)^2) per action dim.
                               # On 3 pilot tasks (2026-11-13, one run each) 0.5 ended the same as 1.0 at round 70
 
 env:                          # one run = one LIBERO-PRO perturbation type across suites; one multi-task residual
