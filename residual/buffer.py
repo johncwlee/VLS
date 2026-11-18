@@ -3,7 +3,7 @@
 One row per executed chunk; episodes are stored contiguously, so the next observation of row i is row i + 1
 (terminal rows have no successor and bootstrap with mask 0). Rows store raw facts (steered, terminal, success)
 and rewards are computed at sample time by `chunk_reward`, so reward hyperparameters can change without
-re-collecting. Pools: protected = offline (Stage 1) episodes + every steered online chunk; online = every
+re-collecting. Pools: protected = offline episodes + every steered online chunk; online = every
 online chunk. Held-out episodes are never sampled for training.
 """
 

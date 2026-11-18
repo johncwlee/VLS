@@ -143,6 +143,7 @@ eval:                         # seeded, paired episodes through the VLS LiberoAd
                               # (the pass criterion asks for both)
   seed: 0                     # with (suite, task, init set, init id) -> the episode seed for the env reset (fixture
                               # poses) and π0.5's flow noise, so two evaluations differ only by the policy
+                              # (qam_velocity: also by bf16 rounding, its policy episodes run π0.5 on 2 rows)
   baseline_ckpt: null         # a checkpoint whose stored baseline outcomes this run reuses (only those, not its
                               # weights), so the baseline is not re-evaluated; items it lacks are still run
 

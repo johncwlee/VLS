@@ -1,8 +1,8 @@
 """End-to-end residual pipeline on one LIBERO task (GPU, slow: ~8 min on an RTX 5090, measured 2026-11-12).
 
-1. Train with a warm-up gate that cannot pass: round 1 collects with exploration noise and a zero residual, the run
-   stops cleanly at round 2. The round-1 eval of the zero residual must match the π0.5 baseline episode for episode.
-2. Resume with a gate any held-out data passes: the actor turns on and trains; Stage 1 is not collected again.
+1. Train one warm-up round: it collects with exploration noise and a zero residual, and its eval of the zero residual
+   must match the π0.5 baseline episode for episode (outcome and length).
+2. Resume for three more rounds: the actor turns on and trains; the offline pool is not collected again.
 3. Evaluate the checkpoint twice in mode=eval: identical per-episode tables, baseline outcomes reused.
 Each launch is `python -m residual.train` in a subprocess, as scripts/run/run_residual.sh runs it, writing only under
 pytest's tmp dir. Needs envs/vls.env sourced (see README).
@@ -59,6 +59,12 @@ def test_warmup_resume_actor_and_repeatable_eval(tmp_path):
     assert not any(k.startswith("update/actor/") for r in rows for k in r)
     warmup_eval = [r for r in rows if "eval/policy/flip_frac" in r]
     assert warmup_eval and warmup_eval[0]["eval/policy/flip_frac"] == 0  # zero residual == π0.5, same seeds
+    tables = run_dir / "tables"
+    for init_set in ("", "_train"):  # the same episodes step for step, not only the same outcomes
+        assert ((tables / f"baseline{init_set}_by_init_round0.csv").read_text()
+                == (tables / f"policy{init_set}_by_init_round1.csv").read_text())
+    assert {r["round"] for r in rows if "episode/success" in r and r["stage"] == 3} == {1}  # logged with their round
+    assert not (run_dir / "buffer" / "image.bin").exists()  # action_residual updates never read images
     wandb_id = (run_dir / "wandb_id.txt").read_text()
 
     launch(tmp_path / "hydra_resume", f"train.resume_dir={run_dir}", "online.rounds=4", "actor.warmup_rounds=1")

@@ -116,9 +116,13 @@ def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_st
 
         for k in range(dims.exec_horizon):
             if record_video:
-                hud = [f"chunk {chunk} step {steps}", f"Q {q_values[-1]:.3f}",
-                       f"|v_phi|/|v_vla| {rows['_ratio'][-1]:.3f}" if "_ratio" in rows else "residual off",
-                       f"|edit| {rows['_edit'][-1]:.3f}" if "_edit" in rows else "edit off"]
+                hud = [f"chunk {chunk} step {steps}", f"Q {q_values[-1]:.3f}"]
+                if "_ratio" in rows:
+                    hud.append(f"|v_phi|/|v_vla| {rows['_ratio'][-1]:.3f}")
+                if "_edit" in rows:  # the action residual, or QAM-E's edit
+                    hud.append(f"{'|delta|' if agent.actor is not None else '|edit|'} {rows['_edit'][-1]:.3f}")
+                if len(hud) == 2:
+                    hud.append("π0.5 only")
                 frames.append(add_text_to_image(np.array(adapter.get_vlm_image()), hud))
             _, _, terminated, truncated, info = adapter.step(raw[k])
             steps += 1

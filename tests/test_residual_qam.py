@@ -172,7 +172,8 @@ def _zero_noise(self, ctx: Context) -> torch.Tensor:
 
 def _split_batch_update(rank: int | None = None, world: int = 1, init_file: str = "", out: str = "",
                         mode: str = "qam_velocity", actor: bool = False) -> dict:
-    """One update on a fixed batch of 8 (rank r of `world` takes its contiguous share). Noise is zeroed so the
+    """One update on a fixed batch of 8 (rank r of `world` takes a contiguous share here; the trainer's
+    shares are strided, which is the same thing for a mean over rows). Noise is zeroed so the
     losses are deterministic and two half-batch ranks must match one full-batch process exactly."""
     import torch.distributed as dist
     if rank is not None:  # spawned process; the full-batch run in the pytest process uses monkeypatch
