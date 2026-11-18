@@ -337,14 +337,6 @@ def test_feature_standardization():
     assert torch.equal(other.feat(ctx), feat)
 
 
-def test_checkpoint_from_before_standardization_loads_as_identity():
-    old = {k: v for k, v in make_agent().state_dict().items() if k not in ("feat_mean", "feat_std")}
-    agent = make_agent()
-    agent.load_state_dict(old)
-    assert torch.equal(agent.feat_mean, torch.zeros(agent.feat_dim))
-    assert torch.equal(agent.feat_std, torch.ones(agent.feat_dim))
-
-
 def test_checkpoint_with_another_bound_is_refused():
     trained = make_agent("action_residual").state_dict()
     with pytest.raises(ValueError, match="bound"):

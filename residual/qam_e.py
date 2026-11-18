@@ -120,11 +120,6 @@ class QAMEAgent(nn.Module):
         features have norm ~34 with a constant offset of ~33 and 2 dims carrying most of the variance."""
         return (self.raw_feat(ctx) - self.feat_mean) / self.feat_std
 
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        for name in ("feat_mean", "feat_std"):  # checkpoints from before standardization: identity = their behaviour
-            state_dict.setdefault(prefix + name, getattr(self, name).new_zeros(self.feat_dim) + (name == "feat_std"))
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
-
     @torch.no_grad()
     def fit_feat_stats(self, raw: Tensor) -> None:
         self.feat_mean.copy_(raw.mean(0))
