@@ -81,11 +81,12 @@ def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_st
                 use_residual: bool, record_video: bool = False, seed: int | None = None,
                 explore_std: torch.Tensor | None = None) -> Episode:
     """seed (evaluation) fixes the scene and π0.5's noise: LIBERO re-draws fixture poses (cabinets, stoves) from
-    np.random at every reset, which set_init_state does not restore, and π0.5's flow noise (then any exploration
-    offset) comes from its own generator: a policy draws the same flow noise as the baseline it is paired with.
-    Without a seed, both follow the global RNGs (training collection)."""
+    np.random at every reset, which set_init_state does not restore, and π0.5's flow noise comes from its own generator: a
+    policy draws the same flow noise as the baseline it is paired with (QAM-E's edit sample has a second generator,
+    so it does not shift that sequence). Without a seed, all follow the global RNGs (training collection)."""
     adapter.reset(seed=None if seed is None else seed % 2 ** 32, options={"init_state": init_state})
     generator = None if seed is None else torch.Generator(pi05.device).manual_seed(seed)
+    edit_generator = None if seed is None else torch.Generator(pi05.device).manual_seed(seed + 1)
     dims, std = agent.dims, pi05.action_std.numpy()
     rows, frames, q_values = defaultdict(list), ([] if record_video else None), []
     steps, chunk, info, policy_time = 0, 0, {}, 0.0
@@ -97,7 +98,7 @@ def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_st
         ctx = pi05.context(batch, torch.tensor([chunk / t_max]))
         noise = agent.noise(ctx, generator)
         out = agent.act(ctx, noise, use_residual=use_residual, with_base=True,
-                        explore_std=explore_std, generator=generator)
+                        explore_std=explore_std, generator=edit_generator)
         raw = pi05.unnormalize(out["a_exec"])[0]
         policy_time += time.perf_counter() - start
 

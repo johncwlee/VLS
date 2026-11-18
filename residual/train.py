@@ -356,15 +356,14 @@ class Trainer:
     def _tag(name: str, init_set: str) -> str:
         return name if init_set == "official" else f"{name}_{init_set}"
 
-    def evaluate(self, items: list[tuple[int, str, int]], *, tag: str, use_residual: bool,
-                 explore_std: torch.Tensor | None = None) -> dict[str, bool]:
+    def evaluate(self, items: list[tuple[int, str, int]], *, tag: str, use_residual: bool) -> dict[str, bool]:
         """Seeded episodes on (task index, init set, init id) items, split over ranks; never added to the buffer.
         Returns {eval_key: success} on every rank (episodes that raised are left out)."""
         items = self._broadcast(items)
         mine, results = items[self.rank::self.world], []
         for k, (task_index, init_set, init_id) in enumerate(mine, 1):
             results.append(self._eval_episode(self.tasks[task_index], init_set, init_id, tag=tag,
-                                              use_residual=use_residual, explore_std=explore_std))
+                                              use_residual=use_residual))
             if self.rank == 0 and (k % PROGRESS_EVERY_EPISODES == 0 or k == len(mine)):
                 log.info(f"Eval [{tag}]: {k}/{len(mine)} episodes on rank 0 ({len(items)} over {self.world} GPU(s))")
         gathered = self._gather(results)
@@ -408,8 +407,7 @@ class Trainer:
                  f"per suite {per_suite} per task {[(t.label, round(float(np.mean(v)), 2)) for t, v in successes.items()]}")
         return outcomes
 
-    def _eval_episode(self, task: Task, init_set: str, init_id: int, *, tag: str, use_residual: bool,
-                      explore_std: torch.Tensor | None) -> dict:
+    def _eval_episode(self, task: Task, init_set: str, init_id: int, *, tag: str, use_residual: bool) -> dict:
         inits = task.official_inits if init_set == "official" else task.train_inits
         seed = self.cfg.eval.seed
         result = {"task": task.index, "init_set": init_set, "init_id": init_id, "ep": None, "rtg": [], "video": None,
@@ -418,7 +416,7 @@ class Trainer:
             ep = run_episode(self.adapter(task), self.pi05, self.agent, task_idx=task.index,
                              init_state=inits[init_id], t_max=task.t_max, use_residual=use_residual,
                              record_video=init_id < self.cfg.logging.video_eval_per_task,
-                             seed=eval_seed(seed, task, init_set, init_id), explore_std=explore_std)
+                             seed=eval_seed(seed, task, init_set, init_id))
         except Exception:
             log.exception(f"Eval episode failed ({task.label}, {init_set} init {init_id}); excluded")
             return result
@@ -689,20 +687,11 @@ class Trainer:
         self._save("last.pt")
 
     def run_eval(self) -> None:
-        """mode=eval: π0.5 baseline on items without a stored outcome, then policy.residual_ckpt and each
-        eval.explore_bounds entry (π0.5 + exploration noise at that s), each paired with the baseline."""
-        cfg, per_task = self.cfg, self.cfg.eval.final_episodes_per_task
-        if cfg.eval.explore_bounds and not self.action_mode:
-            raise SystemExit("eval.explore_bounds needs actor.mode=action_residual")
+        """mode=eval: the π0.5 baseline on items without a stored outcome, then policy.residual_ckpt paired with it."""
+        per_task = self.cfg.eval.final_episodes_per_task
         self._ensure_baseline(per_task)
-        if cfg.policy.residual_ckpt:
+        if self.cfg.policy.residual_ckpt:
             self._evaluate_policy(per_task)
-        for bound in cfg.eval.explore_bounds:
-            for init_set in cfg.eval.init_sets:
-                tag = self._tag(f"explore_s{round(bound * 100):03d}", init_set)  # no dots in wandb keys
-                outcomes = self.evaluate(self.eval_items(init_set, per_task), tag=tag, use_residual=False,
-                                         explore_std=self.agent.explore_std(bound))
-                self._paired_report(tag, outcomes)
 
     def _log_round(self, rnd: int, wall: float) -> None:
         if self.rank > 0:

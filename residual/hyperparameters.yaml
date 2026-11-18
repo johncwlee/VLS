@@ -6,7 +6,7 @@
 seed: 0
 device: cuda
 mode: train                   # train | eval (no collection or updates: the π0.5 baseline on the eval items, then
-                              # policy.residual_ckpt and each eval.explore_bounds entry, all paired with the baseline)
+                              # policy.residual_ckpt paired with it)
 
 actor:                        # which steering policy is trained
   mode: action_residual       # action_residual: bounded correction added to π0.5's executed chunk, trained to
@@ -142,7 +142,6 @@ eval:                         # seeded, paired episodes through the VLS LiberoAd
                               # (the pass criterion asks for both)
   seed: 0                     # with (suite, task, init set, init id) -> the episode seed for the env reset (fixture
                               # poses) and π0.5's flow noise, so two evaluations differ only by the policy
-  explore_bounds: []          # mode=eval: also π0.5 + exploration noise at each s, e.g. [0.1,0.2,0.4] (probe)
   baseline_ckpt: null         # a checkpoint whose stored baseline outcomes this run reuses (only those, not its
                               # weights), so the baseline is not re-evaluated; items it lacks are still run
 

@@ -130,15 +130,15 @@ class QAMEAgent(nn.Module):
         self.feat_mean.copy_(raw.mean(0))
         self.feat_std.copy_(raw.std(0).clamp_min(FEAT_STD_FLOOR))
 
-    def bound_vector(self, bound: float | None = None) -> Tensor:
-        """Per action dim: s (actor.bound, or `bound`) on the pose dims, actor.gripper_bound on the last (gripper)."""
-        b = torch.full((self.dims.action_dim,), float(self.cfg.actor.bound if bound is None else bound))
+    def bound_vector(self) -> Tensor:
+        """Per action dim: s (actor.bound) on the pose dims, actor.gripper_bound on the last (gripper)."""
+        b = torch.full((self.dims.action_dim,), float(self.cfg.actor.bound))
         b[-1] = float(self.cfg.actor.gripper_bound)
         return b.to(self.action_low.device)
 
-    def explore_std(self, bound: float | None = None) -> Tensor:
+    def explore_std(self) -> Tensor:
         """Std of the collection-time exploration offset per action dim: explore.std_frac * s, 0 where s is 0."""
-        return self.cfg.explore.std_frac * self.bound_vector(bound)
+        return self.cfg.explore.std_frac * self.bound_vector()
 
     def clip(self, a: Tensor) -> Tensor:
         return torch.clamp(a, self.action_low, self.action_high) if self.cfg.qam.clip_actions else a
@@ -209,8 +209,8 @@ class QAMEAgent(nn.Module):
         """Executed chunk [B, n_exec, A] (normalized, clipped), plus diagnostics and the same-noise base chunk.
         use_residual applies the learned policy (the action residual, or the velocity residual and QAM-E's edit);
         without it the chunk is π0.5's. explore_std [A] adds one Gaussian offset per action
-        dim, held over the chunk (collection and the exploration probe; noise drawn per step would largely cancel
-        within a chunk), drawn from `generator` when given (seeded evaluation)."""
+        dim, held over the chunk (collection only; noise drawn per step would largely cancel within a chunk).
+        `generator` seeds QAM-E's edit sample (seeded evaluation)."""
         if self.actor is not None:
             x0, stats = self.sample_chunk(ctx, noise, use_residual=False)
             a_base = self.clip(self.exec_slice(x0))
@@ -221,7 +221,7 @@ class QAMEAgent(nn.Module):
                 out["edit"] = self.actor(self.feat(ctx), a_base)
                 a = a + out["edit"]
             if explore_std is not None:
-                a = a + torch.randn(a.shape[0], 1, a.shape[-1], device=a.device, generator=generator) * explore_std
+                a = a + torch.randn(a.shape[0], 1, a.shape[-1], device=a.device) * explore_std
             out["a_exec"] = a = self.clip(a)
             out["q"] = self.pessimistic_q(ctx, a)
             return out
