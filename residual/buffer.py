@@ -31,20 +31,24 @@ def chunk_reward(steered: np.ndarray, terminal: np.ndarray, success: np.ndarray,
     return reward.astype(np.float32), (~terminal).astype(np.float32)
 
 
-def field_specs(image_shape: tuple[int, ...], d: "Dims") -> dict[str, tuple[str, tuple[int, ...]]]:
-    return {
-        "image": ("uint8", image_shape), "image2": ("uint8", image_shape),  # env-preprocessed (flipped) cameras
-        "state": ("float32", (d.state_dim,)),       # raw proprio, re-normalized by the policy preprocessor
+def field_specs(image_shape: tuple[int, ...], d: "Dims", images: bool) -> dict[str, tuple[str, tuple[int, ...]]]:
+    """images: also store the cameras and the raw state (~0.4 MB per chunk). qam_velocity needs them: its updates
+    call π0.5's action expert, whose prefix KV cache (~84 MB per observation) is rebuilt from them; the pooled
+    h_prefix cannot replace it. action_residual updates read only the stored features and a_base."""
+    specs = {
         "state_norm": ("float32", (d.state_dim,)),  # as the policy saw it (critic features without a π0.5 pass)
-        "task": ("int16", ()), "episode": ("int32", ()), "step": ("int16", ()),
+        "task": ("int16", ()), "step": ("int16", ()),
         "a_exec": ("float32", (d.exec_horizon, d.action_dim)),  # normalized, clipped, edited: the TD action
         # π0.5 alone from the same noise: the action residual's input (critic target and actor loss use it)
         "a_base": ("float32", (d.exec_horizon, d.action_dim)),
-        "noise": ("float16", (d.horizon, d.pad_dim)),
-        "h_prefix": ("float16", (d.prefix_dim,)), "latent": ("float16", (d.ae_dim,)),
-        "steered": ("bool", ()), "trigger": ("uint8", ()), "terminal": ("bool", ()), "success": ("bool", ()),
+        "h_prefix": ("float16", (d.prefix_dim,)),
+        "steered": ("bool", ()), "terminal": ("bool", ()), "success": ("bool", ()),
         "protected": ("bool", ()), "online": ("bool", ()), "heldout": ("bool", ()),
     }
+    if images:
+        specs.update({"image": ("uint8", image_shape), "image2": ("uint8", image_shape),  # env-preprocessed (flipped)
+                      "state": ("float32", (d.state_dim,))})  # raw proprio, re-normalized by the policy preprocessor
+    return specs
 
 
 class ReplayBuffer:
@@ -80,19 +84,19 @@ class ReplayBuffer:
         self.online_idx = np.flatnonzero(d["online"][:n] & trainable)
 
     def add_episode(self, chunks: dict[str, np.ndarray], meta: dict, online: bool, heldout: bool) -> None:
-        """Append one finished episode (dict of [T, ...] arrays) and persist the index atomically."""
+        """Append one finished episode (dict of [T, ...] arrays; fields outside the layout are not stored) and
+        persist the index atomically."""
         length = len(chunks["a_exec"])
         if self.size + length > self.capacity:
             # ponytail: no ring overwrite (protected data must survive); raise capacity if a run outgrows it
             raise RuntimeError(f"Replay buffer full ({self.capacity} chunks); raise train.buffer_capacity_per_task")
         rows = slice(self.size, self.size + length)
-        for k, arr in chunks.items():
-            self.data[k][rows] = arr
+        for k in self.data.keys() & chunks.keys():
+            self.data[k][rows] = chunks[k]
         steered = np.asarray(chunks["steered"], dtype=bool)
         self.data["online"][rows] = online
         self.data["protected"][rows] = steered | (not online)
         self.data["heldout"][rows] = heldout
-        self.data["episode"][rows] = len(self.episodes)
         for arr in self.data.values():
             arr.flush()
         self.episodes.append({**meta, "id": len(self.episodes), "start": self.size, "length": length,

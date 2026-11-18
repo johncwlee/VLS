@@ -176,21 +176,19 @@ class QAMEAgent(nn.Module):
         base, x = ctx.base, noise
         if with_base:
             base, x = (base.repeat(2) if base is not None else None), torch.cat([noise, noise])
-        latent, ratios, sats = None, [], []
+        ratios, sats = [], []
         while time >= -dt / 2:
             t = time.expand(x.shape[0])
             v, hidden = self.base_fn(base, x, t)
-            ae_pool = hidden[:bsize].mean(1)
-            latent = ae_pool if latent is None else latent  # first flow step: RL²-VLA / SAFE latent
             if use_residual:
                 v_own = v[:bsize]
-                v_phi, sat = self._residual(x[:bsize], t[:bsize], v_own, ae_pool, ctx)
+                v_phi, sat = self._residual(x[:bsize], t[:bsize], v_own, hidden[:bsize].mean(1), ctx)
                 ratios.append(v_phi.norm(dim=-1).mean() / (v_own[..., : self.dims.action_dim].norm(dim=-1).mean() + 1e-8))
                 sats.append(sat.float().mean())
                 v = torch.cat([v_own + self._pad(v_phi), v[bsize:]])
             x = x + dt * v
             time = time + dt
-        stats = {"latent": latent}
+        stats = {}
         if use_residual:
             stats.update(ratio=torch.stack(ratios).mean(), sat=torch.stack(sats).mean())
         if with_base:
@@ -206,10 +204,10 @@ class QAMEAgent(nn.Module):
         dim, held over the chunk (collection only; noise drawn per step would largely cancel within a chunk).
         `generator` seeds QAM-E's edit sample (seeded evaluation)."""
         if self.actor is not None:
-            x0, stats = self.sample_chunk(ctx, noise, use_residual=False)
+            x0, _ = self.sample_chunk(ctx, noise, use_residual=False)
             a_base = self.clip(self.exec_slice(x0))
             ctx = replace(ctx, a_base=a_base)
-            out = {"latent": stats["latent"], "ratio": None, "sat": None, "edit": None, "a_base": a_base}
+            out = {"ratio": None, "sat": None, "edit": None, "a_base": a_base}
             a = a_base
             if use_residual:
                 out["edit"] = self.actor(self.feat(ctx), a_base)
@@ -223,7 +221,7 @@ class QAMEAgent(nn.Module):
         use_residual = use_residual and self.cfg.qam.inv_temp > 0  # QAM: inv_temp == 0 samples the base only
         x0, stats = self.sample_chunk(ctx, noise, use_residual, with_base=with_base and use_residual)
         a = self.clip(self.exec_slice(x0))
-        out = {"latent": stats["latent"], "ratio": stats.get("ratio"), "sat": stats.get("sat"), "edit": None}
+        out = {"ratio": stats.get("ratio"), "sat": stats.get("sat"), "edit": None}
         if use_edit:
             edit, _ = self.edit(self.feat(ctx), a, generator)
             out["edit"] = self.cfg.edit.scale * edit

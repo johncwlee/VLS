@@ -117,7 +117,8 @@ class Trainer:
         if cfg.eval.baseline_ckpt:  # baseline outcomes only: any actor.bound / architecture can pair with them
             self.state["baseline"].update(torch.load(cfg.eval.baseline_ckpt, weights_only=True)["state"]["baseline"])
         libero_env = self.adapter(self.tasks[0])._env[0]
-        specs = field_specs((3, libero_env.observation_height, libero_env.observation_width), self.dims)
+        specs = field_specs((3, libero_env.observation_height, libero_env.observation_width), self.dims,
+                            images=not self.action_mode)
         # eval collects nothing
         capacity = 1 if cfg.mode == "eval" else cfg.train.buffer_capacity_per_task * len(self.tasks)
         if self.rank == 0:
@@ -292,8 +293,7 @@ class Trainer:
 
     def import_expert(self) -> None:
         """offline.source=vls: the successful episodes VLS recorded for this run's tasks (main.py, main.record_dir)
-        are the protected pool, as off-policy chunks. Features are recomputed from the stored images;
-        noise and latent stay zero (VLS does not produce them; the action residual never reads them). Episodes
+        are the protected pool, as off-policy chunks. Features are recomputed from the recorded images. Episodes
         carry stage 0, so the Stage 1 plan does not count them, and a resumed run skips the files it has."""
         cfg = self.cfg
         for task in self.tasks if self.rank == 0 else []:
@@ -304,8 +304,7 @@ class Trainer:
                 data = np.load(path)
                 n = len(data["a_exec"])
                 chunks = {k: data[k] for k in ("image", "image2", "state", "steered", "terminal", "success")}
-                chunks.update(task=np.full(n, task.index, dtype=np.int16), step=np.arange(n, dtype=np.int16),
-                              trigger=np.zeros(n, dtype=np.uint8))
+                chunks.update(task=np.full(n, task.index, dtype=np.int16), step=np.arange(n, dtype=np.int16))
                 ctx = self._context(chunks)
                 chunks.update({k: self.agent.clip(torch.from_numpy(data[k]).to(cfg.device)).cpu().numpy()
                                for k in ("a_exec", "a_base")},

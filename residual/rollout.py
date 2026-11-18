@@ -106,9 +106,7 @@ def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_st
         for key, value in (("image", image[0]), ("image2", image2[0]), ("state", state[0]),
                            ("state_norm", batch[OBS_STATE][0].float().cpu().numpy()),
                            ("a_exec", out["a_exec"][0].cpu().numpy()), ("a_base", out["a_base"][0].cpu().numpy()),
-                           ("noise", noise[0].cpu().numpy().astype(np.float16)),
-                           ("h_prefix", ctx.h_prefix[0].cpu().numpy().astype(np.float16)),
-                           ("latent", out["latent"][0].cpu().numpy().astype(np.float16))):
+                           ("h_prefix", ctx.h_prefix[0].cpu().numpy().astype(np.float16))):
             rows[key].append(value)
         for key in ("ratio", "sat"):
             if out[key] is not None:
@@ -136,7 +134,7 @@ def run_episode(adapter, pi05: Pi05, agent: QAMEAgent, *, task_idx: int, init_st
     n = len(rows["a_exec"])
     chunks = {k: np.stack(v) for k, v in rows.items() if not k.startswith("_")}
     chunks.update(task=np.full(n, task_idx, dtype=np.int16), step=np.arange(n, dtype=np.int16),
-                  steered=np.zeros(n, dtype=bool), trigger=np.zeros(n, dtype=np.uint8))
+                  steered=np.zeros(n, dtype=bool))
     diff = np.abs(chunks["a_exec"] - chunks["a_base"]) * std  # raw units
     stats = {"exec_vs_base_trans": diff[..., :3].mean(), "exec_vs_base_rot": diff[..., 3:6].mean(),
              "exec_vs_base_grip": diff[..., 6:].mean(), "policy_time_per_chunk": policy_time / n}

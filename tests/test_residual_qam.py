@@ -135,7 +135,7 @@ def test_chunk_reward():
 def test_buffer_resume_and_readonly_view(tmp_path):
     """A reopened buffer (resume, or a rank > 0 view) sees the same episodes and pools; a smaller capacity or another
     layout is refused."""
-    specs = field_specs((3, 4, 4), DIMS)
+    specs = field_specs((3, 4, 4), DIMS, images=True)
     buf = ReplayBuffer(tmp_path, 20, specs)
     view = ReplayBuffer(tmp_path, 20, specs, readonly=True)
     chunks = {"a_exec": np.ones((3, DIMS.exec_horizon, DIMS.action_dim), np.float32), "steered": np.zeros(3, bool),
@@ -151,7 +151,7 @@ def test_buffer_resume_and_readonly_view(tmp_path):
     with pytest.raises(ValueError):
         ReplayBuffer(tmp_path, 19, specs)
     with pytest.raises(ValueError):
-        ReplayBuffer(tmp_path, 20, field_specs((3, 5, 5), DIMS))
+        ReplayBuffer(tmp_path, 20, field_specs((3, 5, 5), DIMS, images=True))
     grown = ReplayBuffer(tmp_path, 30, specs)  # a full buffer can be resumed with a larger capacity
     grown.add_episode(chunks, {"task": 0}, online=True, heldout=False)
     assert grown.size == 9 and grown.data["terminal"][8] and grown.data["terminal"][2]
@@ -419,7 +419,7 @@ def test_actor_loss_gives_the_critic_no_gradient():
 
 
 def test_heldout_episodes_are_never_sampled_and_terminal_rows_have_no_successor(tmp_path):
-    buf = ReplayBuffer(tmp_path, 20, field_specs((3, 4, 4), DIMS))
+    buf = ReplayBuffer(tmp_path, 20, field_specs((3, 4, 4), DIMS, images=True))
     chunks = {"a_exec": np.ones((3, DIMS.exec_horizon, DIMS.action_dim), np.float32), "steered": np.zeros(3, bool),
               "terminal": np.array([False, False, True]), "success": np.array([False, False, True])}
     for online, heldout in ((False, False), (False, True), (True, False), (True, True)):

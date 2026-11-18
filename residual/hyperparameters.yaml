@@ -129,7 +129,8 @@ train:
                               # qam_velocity: use 32 (π0.5's prefix is recomputed for s and s' every update,
                               # ~1.9 s prefix + ~1.9 s QAM-E per update at 32 on an RTX 5090, 2026-11-08)
   buffer_capacity_per_task: 40000   # chunks per task (capacity = this x number of tasks); disk-backed memmap in
-                              # the run dir, ~0.4 MB per chunk written. Sized for 100 rounds x 10 episodes at ~27
+                              # the run dir: ~5 KB per chunk written (action_residual), ~0.4 MB with the camera
+                              # images qam_velocity needs. Sized for 100 rounds x 10 episodes at ~27
                               # chunks per episode (2026-11-16) plus the offline pool, with ~45 % headroom
   resume_dir: null            # a previous run dir: continue from its last.pt and buffer
 
