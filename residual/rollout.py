@@ -4,6 +4,7 @@ adapter, success/termination from the env (spec §7.1 labels: `label_source = "s
 """
 
 import time
+import xml.etree.ElementTree as ET
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,7 +28,26 @@ def make_adapter(env_overrides: dict, task_id: int):
     cfg = OmegaConf.to_container(OmegaConf.load(VLS_ROOT / "configs/backend/libero.yaml").libero, resolve=True)
     cfg.update(env_overrides)
     cfg.update(task_ids_filter=[task_id], episode_num=1, start_episode=0)
-    return create_adapter("libero", cfg)
+    adapter = create_adapter("libero", cfg)
+    if torch.cuda.is_available() and "A100" in torch.cuda.get_device_name():
+        for env in adapter._env:  # robosuite rebuilds the sim from XML at every (hard) reset, so edit the XML
+            env._env.env.set_xml_processor(no_msaa)
+    return adapter
+
+
+def no_msaa(xml: str) -> str:
+    """Anti-aliasing off. On A100s EGL's MSAA resolve is not repeatable (2026-11-18, Narval and DGX: 5-8 distinct
+    images over 30 renders of one state, up to 4 pixels off by 1/255; identical with offsamples=0, and on an RTX 5090
+    either way), and π0.5 turns that into different episodes, breaking seeded paired evaluation."""
+    root = ET.fromstring(xml)
+    visual = root.find("visual")
+    if visual is None:
+        visual = ET.SubElement(root, "visual")
+    quality = visual.find("quality")
+    if quality is None:
+        quality = ET.SubElement(visual, "quality")
+    quality.set("offsamples", "0")
+    return ET.tostring(root, encoding="unicode")
 
 
 def task_specs(env_cfg) -> list[tuple[str, int]]:
