@@ -108,7 +108,6 @@ class QAMEAgent(nn.Module):
                 groups["edit"] = [p for n, p in self.edit.named_parameters() if n != "log_alpha"]
                 groups["alpha"] = [self.edit.log_alpha]
         self.optims = {k: torch.optim.Adam(list(v), lr=cfg.qam.lr) for k, v in groups.items()}
-        self.timer = lambda name: contextlib.nullcontext()  # the trainer swaps in monitor.Timer for update/time/*
 
     # ---------------------------------------------------------------- helpers
     def raw_feat(self, ctx: Context) -> Tensor:
@@ -321,7 +320,7 @@ class QAMEAgent(nn.Module):
         x = self.noise(ctx)
         bsize = x.shape[0]
         xs, v_vlas, aes = [], [], []
-        with torch.no_grad(), self.timer("adjoint_rollout"):
+        with torch.no_grad():
             for i in range(steps):
                 s = i * h
                 t = torch.full((bsize,), 1.0 - s, device=x.device)
@@ -343,8 +342,7 @@ class QAMEAgent(nn.Module):
                 "update/adjoint/dq_da_norm": adj.flatten(1).norm(dim=-1).mean() / self.cfg.qam.inv_temp
                 if self.cfg.qam.inv_temp > 0 else adj.new_zeros(())}
         adjs = [None] * steps
-        with self.timer("vjp"):
-            self._lean_adjoint(ctx, xs, adj, adjs, h)
+        self._lean_adjoint(ctx, xs, adj, adjs, h)
         return torch.stack(xs), torch.stack(adjs), torch.stack(v_vlas), torch.stack(aes), \
             torch.arange(steps, device=x.device) * h, info
 
@@ -407,29 +405,24 @@ class QAMEAgent(nn.Module):
         """One step: all losses use the pre-update parameters (as in QAM's joint loss), then each module steps.
         action_residual trains the actor only when `actor` (off during the critic warm-up; every rank must pass
         the same value); qam_velocity always trains the residual and the edit."""
-        with self.timer("critic"):
-            critic_loss, info = self.critic_loss(ctx, action, reward, mask, next_ctx)
+        critic_loss, info = self.critic_loss(ctx, action, reward, mask, next_ctx)
         losses, hist = {"critic": critic_loss}, {}
         if self.actor is not None:
             if actor:
-                with self.timer("actor"):
-                    losses["actor"], actor_info, hist = self.actor_loss(ctx)
+                losses["actor"], actor_info, hist = self.actor_loss(ctx)
                 info.update(actor_info)
         else:
             losses["residual"], res_info, hist = self.residual_loss(ctx)
             info.update(res_info)
             if self.edit is not None:
-                with self.timer("edit"):
-                    losses["edit"], losses["alpha"], edit_info, edit_hist = self.edit_losses(ctx)
+                losses["edit"], losses["alpha"], edit_info, edit_hist = self.edit_losses(ctx)
                 info.update(edit_info)
                 hist.update(edit_hist)
         for opt in self.optims.values():
             opt.zero_grad(set_to_none=True)
-        with self.timer("backward"):
-            sum(losses.values()).backward()
+        sum(losses.values()).backward()
         if dist.is_initialized() and dist.get_world_size() > 1:
-            with self.timer("all_reduce"):
-                info = self._average_over_ranks(info)
+            info = self._average_over_ranks(info)
         max_norm = self.cfg.qam.clip_grad_norm
         for name, opt in self.optims.items():
             params = [p for g in opt.param_groups for p in g["params"]]

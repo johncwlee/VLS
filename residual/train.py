@@ -106,8 +106,7 @@ class Trainer:
         self.t_max_by_task = np.array([t.t_max for t in self.tasks])
         self.agent = QAMEAgent(cfg, self.dims, self.pi05.velocity_and_hidden, self.pi05.action_low,
                                self.pi05.action_high).to(cfg.device)
-        self.timer = Timer()
-        self.agent.timer = self.timer
+        self.timer = Timer()  # update/time/*
         # baseline: {eval_key: success} of plain π0.5; actor_on: action_residual warm-up is over
         self.state = {"stage": 1, "round": 0, "update_step": 0, "best_eval": -1.0, "baseline": {},
                       "actor_on": False, "warmup_eval_done": False}
