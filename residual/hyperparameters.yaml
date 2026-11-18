@@ -101,7 +101,7 @@ qam:                          # inv_temp and use_target_grad: qam_velocity only;
                               # (NOT [-1, 1] normalized, which would cap rotation at ~1 std)
   use_target_grad: true       # the adjoint starts from the target critic's dQ/da (QAM default)
 
-offline:                      # spec Stages 1-2
+offline:                      # the protected (offline) pool, filled before round 1 and mixed into every batch
   source: pi05                # what fills the protected (offline) pool at Stage 1:
                               #   pi05: episodes_per_task π0.5-only rollouts per task (default)
                               #   vls:  the successful VLS episodes under expert_dir, as off-policy expert data
@@ -112,12 +112,7 @@ offline:                      # spec Stages 1-2
                               # main.record_dir=<this dir> backend.libero.init_state_dir=<split.train_init_dir>
                               # (<dir>/<suite>/task<id>/init<i>_success.npz; relative to modules/VLS). Chunks keep
                               # their steered flag; a_base is π0.5's chunk from the same noise
-  heldout_frac: 0.1           # episodes kept out of training for the Stage 2 gate (Q vs return-to-go)
-  updates: 0                  # Stage 2 offline updates before round 1. 0 = none (RLPD: the offline pool is only
-                              # mixed into online batches, and the warm-up rounds train the critic). Above 0: critic
-                              # pre-training on the offline pool (critic only in action_residual mode). 2000 until
-                              # 2026-11-13: held-out Q-vs-return corr only 0.24-0.45 after it, 0.75-0.95 from the
-                              # online rounds. qam_velocity used 2000 (~2 h at batch 32 on one RTX 5090)
+  heldout_frac: 0.1           # episodes kept out of training for the logged gate/* Q vs return-to-go
 
 online:                       # spec Stage 3 (no agent yet)
   rounds: 100
@@ -128,7 +123,6 @@ online:                       # spec Stage 3 (no agent yet)
                               # worse than 1500 (+0.35 vs +0.44 paired). qam_velocity: use 200 (~13 min at 32)
   offline_ratio: 0.5          # fraction of each batch from the protected pool (spec §9: 50:50, RLPD-style)
   heldout_frac: 0.1           # online episodes kept out of training, for the logged gate/* action metrics
-  reinit_each_round: false    # true = restart from stage2.pt every round (spec §10 comparison)
 
 train:
   batch_size: 256             # PER GPU: a -g N run trains on N x batch_size rows per update (RLPD uses 256).
@@ -137,7 +131,6 @@ train:
   buffer_capacity_per_task: 40000   # chunks per task (capacity = this x number of tasks); disk-backed memmap in
                               # the run dir, ~0.4 MB per chunk written. Sized for 100 rounds x 10 episodes at ~27
                               # chunks per episode (2026-11-16) plus the offline pool, with ~45 % headroom
-  ckpt_every_updates: 1000    # last.pt during Stage 2 (Stage 3 also saves after every round)
   resume_dir: null            # a previous run dir: continue from its last.pt and buffer
 
 eval:                         # seeded, paired episodes through the VLS LiberoAdapter; never added to the buffer

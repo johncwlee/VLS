@@ -1,13 +1,12 @@
-"""Train a residual on frozen π0.5 on LIBERO-PRO (spec Stages 1-3, no agent yet), or evaluate one (mode=eval).
+"""Train a residual on frozen π0.5 on LIBERO-PRO (no agent yet), or evaluate one (mode=eval).
 
 Baseline: plain π0.5 on seeded eval items (task, init set, init id); every later evaluation is paired with it.
-Stage 1: π0.5-only rollouts on seeded train inits -> protected pool (some episodes held out for the gate).
-Stage 2: offline.updates on the protected pool (critic only in action_residual mode; 0 by default, so the pool only
-  feeds the online batches); critic features are standardized with the pool's statistics first. Gate = critic Q vs
-  realized return-to-go on held-out episodes.
-Stage 3: rounds of [collect into the online pool; 50:50 updates; gate; paired eval every eval.every_rounds].
+Offline pool (state stage 1): π0.5-only rollouts on seeded train inits, or VLS expert episodes -> protected pool
+  (some episodes held out); critic / actor features are standardized with the pool's statistics.
+Online rounds (stage 3): [collect into the online pool; 50:50 updates; gate/* diagnostics; paired eval every
+  eval.every_rounds].
   action_residual: collection adds exploration noise. The actor stays at zero for the first actor.warmup_rounds
-  rounds (critic warm-up); gate/* is logged only.
+  rounds (critic warm-up).
   qam_velocity: collection and updates as QAM-E (velocity residual + edit).
 Run from the repo root: scripts/run/run_residual.sh [overrides]; resume with train.resume_dir=<run dir>.
 Multi-GPU (-g N, torchrun): one rank per GPU, each with its own π0.5 and envs. Collection runs in waves of one
@@ -131,7 +130,7 @@ class Trainer:
         self.round_walls: list[float] = []
         self.rng = np.random.default_rng(cfg.seed)
         if (run_dir / "last.pt").exists():
-            self._load(run_dir / "last.pt", full=True)
+            self._load(run_dir / "last.pt")
             log.info(f"Resumed {run_dir} at {self.state} with {self.buffer.size} chunks")
         if self.world > 1:
             for t in self.agent.state_dict().values():  # identical replicas (also params and buffers)
@@ -195,19 +194,18 @@ class Trainer:
         torch.save(payload, tmp)
         os.replace(tmp, self.run_dir / name)
 
-    def _load(self, path: Path, full: bool) -> None:
+    def _load(self, path: Path) -> None:
         payload = torch.load(path, weights_only=True)
         self.agent.load_state_dict(payload["agent"])
         self.agent.load_optim_state_dict(payload["optim"])
-        if full:
-            # keys added since the checkpoint keep their defaults; baseline outcomes from eval.baseline_ckpt stay
-            baseline = {**self.state["baseline"], **payload["state"].get("baseline", {})}
-            self.state.update(payload["state"], baseline=baseline)
-            self.rng.bit_generator.state = payload["rng"]["numpy"]
-            random.setstate(payload["rng"]["python"])
-            torch.set_rng_state(payload["rng"]["torch"])
-            # one state per GPU the saver saw; a torchrun rank sees one GPU, so restore only as many as exist
-            torch.cuda.set_rng_state_all(payload["rng"]["cuda"][:torch.cuda.device_count()])
+        # keys added since the checkpoint keep their defaults; baseline outcomes from eval.baseline_ckpt stay
+        baseline = {**self.state["baseline"], **payload["state"].get("baseline", {})}
+        self.state.update(payload["state"], baseline=baseline)
+        self.rng.bit_generator.state = payload["rng"]["numpy"]
+        random.setstate(payload["rng"]["python"])
+        torch.set_rng_state(payload["rng"]["torch"])
+        # one state per GPU the saver saw; a torchrun rank sees one GPU, so restore only as many as exist
+        torch.cuda.set_rng_state_all(payload["rng"]["cuda"][:torch.cuda.device_count()])
 
     # ---------------------------------------------------------------- counters derived from the buffer
     @property
@@ -568,7 +566,9 @@ class Trainer:
         batch = self.pi05.preprocess(rows["image"], rows["image2"], rows["state"], tasks)
         return self.pi05.context(batch, torch.from_numpy(rows["step"] / self.t_max_by_task[rows["task"]]).float())
 
-    def train(self, n_updates: int, offline_ratio: float, stage_ckpt: bool) -> None:
+    def train(self) -> None:
+        """One round's updates: online.updates_per_round batches, online.offline_ratio of each from the protected
+        pool."""
         cfg, device = self.cfg, self.cfg.device
         # action_residual: stored features and π0.5's chunk a_base, no π0.5 pass; qam_velocity re-encodes images
         stored = self.action_mode
@@ -577,10 +577,10 @@ class Trainer:
         # strided: sample() puts protected rows before online ones, so a contiguous share would give rank 0
         # (which logs batch metrics) only offline data
         mine = slice(self.rank, None, self.world)
-        for _ in range(n_updates):
+        for _ in range(cfg.online.updates_per_round):
             idx = next_idx = None
             if self.rank == 0:  # train.batch_size is per GPU
-                idx = self.buffer.sample(cfg.train.batch_size * self.world, offline_ratio, self.rng)
+                idx = self.buffer.sample(cfg.train.batch_size * self.world, cfg.online.offline_ratio, self.rng)
                 next_idx = self.buffer.next_index(idx)
             idx, next_idx = self._broadcast((idx, next_idx))
             with self.timer("sample"):
@@ -597,13 +597,9 @@ class Trainer:
                                                torch.from_numpy(reward).to(device), torch.from_numpy(mask).to(device),
                                                next_ctx, actor=self.state["actor_on"])
             self.state["update_step"] += 1
-            step = self.state["update_step"]
             self._nan_guard(info, idx, next_idx)
-            if self.rank > 0:  # info is already averaged over ranks; rank 0 logs and checkpoints
-                continue
-            self._log_update(window, info, hist, idx, reward, rows["terminal"])
-            if stage_ckpt and step % cfg.train.ckpt_every_updates == 0:
-                self._save("last.pt")
+            if self.rank == 0:  # info is already averaged over ranks
+                self._log_update(window, info, hist, idx, reward, rows["terminal"])
 
     def _log_update(self, window: dict, info: dict, hist: dict, idx: np.ndarray, reward: np.ndarray,
                     terminal: np.ndarray) -> None:
@@ -662,14 +658,7 @@ class Trainer:
             else:
                 raise SystemExit(f"offline.source must be 'pi05' or 'vls', got {cfg.offline.source!r}")
             self._fit_feat_stats()
-            s["stage"] = 2
-            self._save("last.pt")
-        if s["stage"] == 2:
-            self.train(cfg.offline.updates - s["update_step"], offline_ratio=1.0, stage_ckpt=True)
-            self.gate()
-            self._save("stage2.pt")
-            self._barrier()  # ranks > 0 load stage2.pt each round when reinit_each_round
-            s["stage"] = 3
+            s["stage"] = 3  # 1 = offline pool, 3 = online rounds, as in the buffer's episode records
             self._save("last.pt")
         while s["round"] < cfg.online.rounds:
             self._round(s["round"] + 1)
@@ -682,11 +671,9 @@ class Trainer:
         warmup = self.action_mode and rnd <= cfg.actor.warmup_rounds
         s["actor_on"] = self.action_mode and not warmup
         start = time.perf_counter()
-        if cfg.online.reinit_each_round:
-            self._load(self.run_dir / "stage2.pt", full=False)
         per_task = [cfg.online.episodes_per_task] * len(self.tasks)
         self.collect(self.remaining(per_task, stage=3, rnd=rnd), stage=3, rnd=rnd, online=True)
-        self.train(cfg.online.updates_per_round, cfg.online.offline_ratio, stage_ckpt=False)
+        self.train()
         self.gate()
         final = rnd == cfg.online.rounds
         # While the actor is zero the policy is π0.5 itself: one eval is enough. It checks the pairing: it matches

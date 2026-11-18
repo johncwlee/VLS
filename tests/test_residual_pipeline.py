@@ -26,7 +26,7 @@ TIMEOUT_S = 3600
 # and its cabinet is a fixture LIBERO re-draws at every reset, so the paired-eval seeding is exercised.
 # heldout_frac 0.5 so that a 4-episode round holds out online episodes for the gate/* action metrics.
 SMALL = ["logging.wandb.mode=offline", "env.suites=[libero_spatial]", "env.task_ids=[1]", "offline.episodes_per_task=2",
-         "offline.updates=20", "online.episodes_per_task=4", "online.updates_per_round=50", "online.heldout_frac=0.5",
+         "online.episodes_per_task=4", "online.updates_per_round=50", "online.heldout_frac=0.5",
          "eval.every_rounds=1", "eval.episodes_per_task=2", "eval.final_episodes_per_task=2",
          "train.buffer_capacity_per_task=2000", "logging.log_every_updates=10", "logging.video_eval_per_task=0"]
 
