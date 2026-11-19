@@ -394,7 +394,11 @@ class Main:
         # Save for stage recognition (used by Gemini)
         self.init_img_with_keypoints = projected_img  # Initial image with keypoint annotations
         self.keypoint_id_to_object = key_points_objects_map  # Keypoint ID -> object name mapping
-        
+
+        if self.config.get('closed_loop_vls', False):
+            self._start_closed_loop(episode_dir, instruction, projected_img, key_points, key_points_objects_map)
+            return
+
         self.vlm_agent.task_dir = os.path.join(episode_dir, 'vlm_agent')     
         os.makedirs(self.vlm_agent.task_dir, exist_ok=True)
         
@@ -446,6 +450,53 @@ class Main:
             return None
         val = action_chunk[0][action_idx][-1]
         return val.item() if hasattr(val, 'item') else val
+
+    def _finger_qpos_m(self) -> list:
+        """LIBERO Panda finger slide joints [q1, q2] in meters: q1 in [0, 0.04], q2 in [-0.04, 0].
+        Opening width = q1 - q2 (adapter.get_gripper_state returns q1 + q2, which stays near 0)."""
+        env = self.adapter._get_current_robosuite_env()
+        finger_joints = env.robots[0].gripper.joints
+        assert len(finger_joints) == 2, f"expected 2 Panda finger joints, got {finger_joints}"
+        return [float(env.sim.data.qpos[env.sim.model.joint_name2id(j)]) for j in finger_joints]
+
+    def _start_closed_loop(self, episode_dir: str, instruction: str, projected_img: np.ndarray,
+                           key_points: np.ndarray, key_points_objects_map: dict) -> None:
+        """main.closed_loop_vls: the first closed-loop call writes the plan and stage-1 guidance (closed_loop/run.py),
+        in place of vlm_agent.generate_guidance. projected_img: RGB start image with keypoints drawn."""
+        from closed_loop import run as closed_loop
+        vlm_cfg = self.cfg.perception.vlm_agent
+        assert self.backend == 'libero', f"closed_loop_vls supports LIBERO only, got {self.backend}"
+        assert self.grasp_steering is None, "closed_loop_vls with grasp steering is not supported"
+        assert vlm_cfg.provider == 'claude_code', f"closed_loop/query.py supports claude_code only, got {vlm_cfg.provider}"
+        self.closed_loop = closed_loop.new_closed_loop(
+            os.path.join(episode_dir, 'closed_loop'), instruction, projected_img, key_points_objects_map,
+            vlm_cfg.model, vlm_cfg.reasoning_effort, self.config.get('closed_loop_time_limit_chunks', 4),
+            self.config.get('vlm_query_limit', 10), self.config.get('schmitt_upper', 0.8),
+            self.config.get('schmitt_lower', 0.6))
+        self.guidance_fns = {}  # filled per chunk by _closed_loop_step; _run_episode checks it exists
+        closed_loop.start_episode(self.closed_loop, key_points)
+
+    def _closed_loop_step(self, stage_state: dict, global_step: int, action_chunk, keypoints: np.ndarray,
+                          mask_ids) -> dict:
+        """main.closed_loop_vls: replaces _update_stage. Makes a check call when a trigger fires and returns
+        stage_state with the stage and guidance flag; self.guidance_fns holds the current stage's functions."""
+        from closed_loop import run as closed_loop
+        from utils.vis_utils import draw_keypoints_on_image
+        gripper_open = None
+        if action_chunk is not None:
+            # Measured fingers, not the command: a single -1 command inside a grasp doesn't move them
+            # (outputs/gripper_width_measure/2026-11-18_22-55-11 ep 9 step 209: 1.50 -> 1.51 cm).
+            # 6 cm: between the widest steady grasp seen (4.57 cm, cream cheese) and the narrowest open (7.63 cm).
+            q1_m, q2_m = self._finger_qpos_m()
+            gripper_open = (q1_m - q2_m) >= 0.06
+        image_kp = draw_keypoints_on_image(self.adapter, np.array(self.adapter.get_vlm_image()), keypoints, mask_ids)
+        stage, use_guidance, fns, stage_changed = closed_loop.on_new_chunk(
+            self.closed_loop, global_step, gripper_open, self.policy.get_normalized_reward(), image_kp, keypoints)
+        if stage_changed:
+            self.policy.reset_stage()  # the reward is normalized per stage (as in _update_stage)
+        self.guidance_fns = {stage: fns}
+        stage_state.update(current_stage=stage, use_guidance=use_guidance)
+        return stage_state
     
     def _update_stage(self, state: dict, gripper_val: Optional[float], 
                       upper_th: float, lower_th: float) -> dict:
@@ -588,8 +639,13 @@ class Main:
                     trial['gripper_closes'] = self.episode_closes  # state at each close command (evaluation only)
                 if self.grasp_steering is not None:  # 0 = the episode ran as plain VLS (no usable grasp target)
                     trial['grasp_engaged_chunks'] = self.grasp_steering.engaged_chunks
+                if self.config.get('closed_loop_vls', False):
+                    trial['stop_reason'] = self.closed_loop['state']['stop_reason']  # None, vls_gave_up, vlm_query_limit
+                    trial['closed_loop_calls'] = self.closed_loop['state']['query_count']
             except Exception as e:
-                trial['outcome'], trial['error'] = 'execution_error', str(e)
+                # Mid-episode VLMCallError comes only from closed_loop/ (the stage recognizer logs its errors instead)
+                trial['outcome'] = 'vlm_error' if isinstance(e, VLMCallError) else 'execution_error'
+                trial['error'] = str(e)
                 log.error(f"Episode {episode+1} execution failed: {e}")
                 import traceback
                 error_file = os.path.join(episode_dir, 'error.txt')
@@ -699,6 +755,19 @@ class Main:
             'ee_pos_before': ee_before.position.tolist(), 'ee_quat_wxyz_before': ee_before.quaternion.tolist(),
             'ee_pos_after': ee_after.position.tolist(), 'ee_quat_wxyz_after': ee_after.quaternion.tolist(),
         }
+        if self.backend == 'libero':
+            record['finger_qpos_m'] = self._finger_qpos_m()
+            # Evaluation only: what LIBERO's On predicate reads (base_object_states.py check_ontop): body origin
+            # (world, m) of each bddl object of interest, and contact for each pair
+            env = self.adapter._get_current_robosuite_env().env  # LIBERO problem env inside OffScreenRenderEnv
+            names = [n for n in env.obj_of_interest if n in env.obj_body_id]
+            record['obj_pos_m'] = {n: env.sim.data.body_xpos[env.obj_body_id[n]].tolist() for n in names}
+            record['obj_contact'] = {}
+            for i, a in enumerate(names):
+                for b in names[i + 1:]:
+                    state_a, state_b = env.object_states_dict[a], env.object_states_dict[b]
+                    record['obj_contact'][f"{a}|{b}"] = bool(state_a.check_contact(state_b))
+            record['success'] = bool(env._check_success())
         with open(os.path.join(episode_dir, 'steps.jsonl'), 'a') as f:
             f.write(json.dumps(record) + "\n")
 
@@ -763,8 +832,16 @@ class Main:
                 
                 # Update stage recognition
                 gripper_val = self._get_gripper_value(action_chunk, action_executed)
-                stage_state = self._update_stage(stage_state, gripper_val, UPPER_THRESHOLD, LOWER_THRESHOLD)
-                
+                if self.config.get('closed_loop_vls', False):
+                    stage_state = self._closed_loop_step(stage_state, global_steps, action_chunk, keypoints, mask_ids)
+                    if self.closed_loop['state']['stop_reason'] is not None:
+                        log.warning(f"Closed loop ended the episode: {self.closed_loop['state']['stop_reason']}")
+                        video_path = os.path.join(episode_dir, f'episode_{episode+1}_fail')
+                        self.video_recorder.save_video(save_path=video_path, success=False, behavior_name='closed_loop_stop')
+                        break
+                else:
+                    stage_state = self._update_stage(stage_state, gripper_val, UPPER_THRESHOLD, LOWER_THRESHOLD)
+
                 current_stage = stage_state['current_stage']
                 use_guidance = stage_state['use_guidance']
                 current_guidance_fns = self.guidance_fns.get(current_stage, []) if use_guidance else None

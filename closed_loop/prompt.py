@@ -47,7 +47,7 @@ def build_prompt(mode, instruction, plan, plan_id, current_stage, history, trigg
         current_stage: 1-based stage the robot is working on. Ignored for "first".
         history: list of dicts with keys step, plan_id, stage, stage_name, chunks, reward_now, reward_best,
             trigger, verdict, evidence.
-        gripper_state: "open" or "closed", from the sign of the last gripper action (main.py: < 0 = open).
+        gripper_state: "open" or "closed", from the measured finger width (main.py _closed_loop_step).
             The camera often can't show it, so without this the VLM can't tell a grasp from a hover.
         key_points_objects_map: {keypoint index: object name}.
         keypoint_positions: (K, 3) keypoint positions in world frame, meters, at the time of this call.
