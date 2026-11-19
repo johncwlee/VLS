@@ -34,6 +34,7 @@ main:
   use_guidance: true
   use_vlm_stage_recognition: true  # Use Gemini to recognize current stage
   vlm_query_limit: 50  # Max VLM queries per episode
+  api_budget_usd: 20.0  # Max Anthropic API spend per run (provider: anthropic); past it, calls use Claude Code (subscription). null = no cap
   guide_scale: 80.0  # fallback only; the LIBERO/CALVIN adapters set it per task
   start_ratio: null  # when diversity hands over to reward guidance (pi0.5: flow time, 1.0 = noise; diffusion: fraction of steps); null = policy default (pi0.5: 0.8)
   # Particle, diversity and FKD params: configs/guidance/<backend>.yaml

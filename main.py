@@ -61,6 +61,7 @@ from core.keypoint_detector import KeypointDetector
 from core.sam3_segmenter import create_segmenter as create_sam3_segmenter
 from core.gemini_grounder import create_gemini_grounder, create_gemini_stage_recognizer
 from vlm_query.vlm_agent import VLMAgent, VLMCallError
+from vlm_query import claude_code_client
 from utils.vis_utils import TrajectoryVideoRecorder, add_text_to_image
 
 from core.diffusion_policy_steer import DiffusionPolicySteer
@@ -103,6 +104,7 @@ class Main:
         """
         self.cfg = cfg
         self.config = cfg.main  # Shortcut to main config section
+        claude_code_client.api_budget_usd = self.config.get('api_budget_usd')
         _require_cuda(OmegaConf.to_container(cfg, resolve=True))
 
         # Log the resolved configuration

@@ -25,12 +25,12 @@ class _VLMClient:
 
     Config keys:
         - provider: 'gemini' (default), 'openai' (any OpenAI-compatible server, e.g. vLLM),
-          or 'claude_code' (Claude via the local Claude Code login)
+          'claude_code' (Claude via the local Claude Code login) or 'anthropic' (Claude Messages API, ANTHROPIC_API_KEY)
         - api_key: API key (default: GOOGLE_API_KEY or OPENAI_API_KEY env var, by provider)
         - base_url: OpenAI-compatible endpoint (openai provider only)
         - model: Model name (default: gemini-2.5-flash)
-        - max_completion_tokens: Response token cap (openai provider only)
-        - reasoning_effort: Thinking effort, e.g. low/medium (openai / claude_code providers; null = model default)
+        - max_completion_tokens: Response token cap (openai / anthropic providers)
+        - reasoning_effort: Thinking effort, e.g. low/medium (openai / claude_code / anthropic providers; null = model default)
     """
 
     def _init_provider(self, config: dict):
@@ -49,13 +49,17 @@ class _VLMClient:
                 'EMPTY' if config.get('base_url') else None)
             if not self.api_key:
                 raise ValueError("OpenAI API key required. Set 'api_key' or 'base_url' in config, or OPENAI_API_KEY env var.")
+        elif self.provider == 'anthropic':
+            if not os.environ.get('ANTHROPIC_API_KEY'):
+                raise ValueError("Anthropic API key required. Set the ANTHROPIC_API_KEY env var.")
         elif self.provider != 'claude_code':  # claude_code uses the local Claude Code login
-            raise ValueError(f"Unknown provider: {self.provider!r} (expected 'gemini', 'openai' or 'claude_code')")
+            raise ValueError(f"Unknown provider: {self.provider!r} "
+                             "(expected 'gemini', 'openai', 'claude_code' or 'anthropic')")
         self._setup_client()
 
     def _setup_client(self):
         """Setup Google Generative AI client, or an OpenAI client for the openai provider."""
-        if self.provider == 'claude_code':
+        if self.provider in ('claude_code', 'anthropic'):
             return
         if self.provider == 'openai':
             from openai import OpenAI
@@ -75,10 +79,11 @@ class _VLMClient:
         """Send a Gemini-style content list (str / PIL images) to the configured provider; return the reply text."""
         if self.provider == 'openai':
             return self._generate_openai(content)
-        if self.provider == 'claude_code':
-            from vlm_query.claude_code_client import query_claude_code
-            return query_claude_code(self._to_openai_parts(content), self.model,
-                                     self.config.get('reasoning_effort')).strip()
+        if self.provider in ('claude_code', 'anthropic'):
+            from vlm_query.claude_code_client import query_claude
+            return query_claude(self.provider, self._to_openai_parts(content), self.model,
+                                self.config.get('reasoning_effort'),
+                                self.config.get('max_completion_tokens', 4000)).strip()
         return self.client.generate_content(content).text.strip()
 
     @staticmethod

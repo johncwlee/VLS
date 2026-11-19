@@ -15,7 +15,7 @@ import re
 from datetime import datetime
 
 from utils.logging_utils import SteerLogger
-from vlm_query.claude_code_client import query_claude_code
+from vlm_query.claude_code_client import query_claude
 log = SteerLogger("VLMAgent")
 
 
@@ -37,14 +37,16 @@ class VLMAgent:
         api_key = config.get('api_key') or os.environ.get('OPENAI_API_KEY') or os.environ.get('OPENAI_API_KEY')
         base_url = config.get('base_url') or os.environ.get('AZURE_OPENAI_BASE_URL')  # For Azure OpenAI
 
-        # 'openai' (any OpenAI-compatible endpoint) or 'claude_code' (Claude via the local Claude Code login)
+        # 'openai' (any OpenAI-compatible endpoint), 'claude_code' (Claude via the local Claude Code login)
+        # or 'anthropic' (Claude Messages API, ANTHROPIC_API_KEY)
         self.provider = config.get('provider', 'openai')
         # Failed VLM calls (message strings), read and reset per trial by main.py like the grounder's
         self.errors = []
-        if self.provider == 'claude_code':
-            log.info(f"Using Claude Code with model: {config['model']}")
+        if self.provider in ('claude_code', 'anthropic'):
+            log.info(f"Using {self.provider} with model: {config['model']}")
         elif self.provider != 'openai':
-            raise ValueError(f"Unknown VLM agent provider: {self.provider!r} (expected 'openai' or 'claude_code')")
+            raise ValueError(f"Unknown VLM agent provider: {self.provider!r} "
+                             "(expected 'openai', 'claude_code' or 'anthropic')")
         elif base_url:
             self.client = OpenAI(api_key=api_key, base_url=base_url)
             log.info(f"Using custom OpenAI endpoint: {base_url}")
@@ -289,10 +291,11 @@ class VLMAgent:
         messages = self._build_prompt(image_path, instruction, save_dir=self.task_dir, **metadata)
         finish_reason = None
         try:
-            if self.provider == 'claude_code':
+            if self.provider in ('claude_code', 'anthropic'):
                 start = time.time()
-                output = query_claude_code(messages[0]['content'], self.config['model'], self.config.get('reasoning_effort'))
-                print(f'[{time.time()-start:.2f}s] Querying Claude Code...Done')
+                output = query_claude(self.provider, messages[0]['content'], self.config['model'],
+                                      self.config.get('reasoning_effort'), self.config['max_completion_tokens'])
+                print(f'[{time.time()-start:.2f}s] Querying {self.provider}...Done')
             else:
                 # stream back the response
                 stream = self.client.chat.completions.create(model=self.config['model'],
@@ -431,9 +434,9 @@ class VLMAgent:
         ]
 
         try:
-            if self.provider == 'claude_code':
-                output = query_claude_code(messages[0]['content'], self.config['model'],
-                                           self.config.get('reasoning_effort')).strip()
+            if self.provider in ('claude_code', 'anthropic'):
+                output = query_claude(self.provider, messages[0]['content'], self.config['model'],
+                                      self.config.get('reasoning_effort'), self.config['max_completion_tokens']).strip()
             else:
                 response = self.client.chat.completions.create(
                     model=self.config['model'],
