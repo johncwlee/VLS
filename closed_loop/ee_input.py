@@ -45,10 +45,11 @@ def wrap_for_poses(fn, ee_input):
 
 def check_on_dummy_poses(fn):
     """Raises ValueError if fn crashes or does not return a scalar tensor with a gradient (like load_functions_from_txt's check)."""
+    from pytorch_kinematics.transforms import axis_angle_to_quaternion, quaternion_to_matrix
+
     rotvec = torch.randn(1, 11, 3) * 0.3
-    from pytorch_kinematics.transforms import axis_angle_to_matrix
     poses = torch.eye(4).repeat(1, 11, 1, 1)  # (1, 11, 4, 4): batch 1, chunk of 10 + current pose
-    poses[..., :3, :3] = axis_angle_to_matrix(rotvec)
+    poses[..., :3, :3] = quaternion_to_matrix(axis_angle_to_quaternion(rotvec))
     poses[..., :3, 3] = torch.randn(1, 11, 3) * 0.2
     poses.requires_grad_(True)
     keypoints = torch.randn(30, 3)
