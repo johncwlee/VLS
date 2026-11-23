@@ -472,9 +472,9 @@ class Main:
             os.path.join(episode_dir, 'closed_loop'), instruction, projected_img, key_points_objects_map,
             vlm_cfg.model, vlm_cfg.reasoning_effort, self.config.get('closed_loop_time_limit_chunks', 4),
             self.config.get('vlm_query_limit', 10), self.config.get('schmitt_upper', 0.8),
-            self.config.get('schmitt_lower', 0.6))
+            self.config.get('schmitt_lower', 0.6), self.config.get('closed_loop_ee_input', 'position'))
         self.guidance_fns = {}  # filled per chunk by _closed_loop_step; _run_episode checks it exists
-        closed_loop.start_episode(self.closed_loop, key_points)
+        closed_loop.start_episode(self.closed_loop, key_points, self.adapter._measure_ee())
 
     def _closed_loop_step(self, stage_state: dict, global_step: int, action_chunk, keypoints: np.ndarray,
                           mask_ids) -> dict:
@@ -491,7 +491,8 @@ class Main:
             gripper_open = (q1_m - q2_m) >= 0.06
         image_kp = draw_keypoints_on_image(self.adapter, np.array(self.adapter.get_vlm_image()), keypoints, mask_ids)
         stage, use_guidance, fns, stage_changed = closed_loop.on_new_chunk(
-            self.closed_loop, global_step, gripper_open, self.policy.get_normalized_reward(), image_kp, keypoints)
+            self.closed_loop, global_step, gripper_open, self.policy.get_normalized_reward(), image_kp, keypoints,
+            self.adapter._measure_ee())
         if stage_changed:
             self.policy.reset_stage()  # the reward is normalized per stage (as in _update_stage)
         self.guidance_fns = {stage: fns}
@@ -898,7 +899,9 @@ class Main:
             )
 
             if generate_new_chunk and use_guidance:
-                grasp_active = any(getattr(fn, 'takes_poses', False) for fn in current_guidance_fns or [])
+                # Closed-loop pose rewards (closed_loop/ee_input.py) also take poses but have no grasp_steering
+                grasp_active = self.grasp_steering is not None and any(
+                    getattr(fn, 'takes_poses', False) for fn in current_guidance_fns or [])
                 executed_poses = None
                 if grasp_active:  # commit check on the executed particle (particle 0)
                     executed_poses = self.grasp_steering.after_chunk(self.policy._cached_action_chunk[:1], global_steps)

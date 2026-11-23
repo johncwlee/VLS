@@ -1,0 +1,35 @@
+def stage1_guidance(keypoints, gripper_points):
+    # ALL code must be inside this function - no external helpers!
+    # Example: grasp keypoint 0 from above, with the fingers closing along the line from keypoint 1 to keypoint 2
+    device = gripper_points.device
+    T = gripper_points.shape[1]
+    timesteps = torch.arange(T, device=device)
+    final_start = int(0.7 * T)
+    weights = torch.where(timesteps >= final_start, torch.tensor(3.0, device=device), torch.tensor(1.0, device=device))
+    weights = weights / weights.sum()
+
+    center = gripper_points[:, :, 0]   # (B, T, 3)
+    tip_a = gripper_points[:, :, 1]
+    tip_b = gripper_points[:, :, 2]
+    wrist = gripper_points[:, :, 3]
+
+    target_idx = torch.tensor([0], dtype=torch.long, device=keypoints.device)
+    target_pos = keypoints[target_idx][0]
+    center_cost = torch.norm(center - target_pos, dim=-1) ** 2                      # (B, T), m^2
+
+    # Wrist 11 cm straight above the target: the gripper approaches from above
+    wrist_target = target_pos + torch.tensor([0.0, 0.0, 0.11], device=device)
+    wrist_cost = torch.norm(wrist - wrist_target, dim=-1) ** 2                      # (B, T), m^2
+
+    # Fingertips on the line from keypoint 1 to keypoint 2, one on each side of the target (either way round)
+    line = keypoints[2] - keypoints[1]
+    line = line / torch.norm(line)
+    side_1 = target_pos + 0.0475 * line
+    side_2 = target_pos - 0.0475 * line
+    cost_ab = torch.norm(tip_a - side_1, dim=-1) ** 2 + torch.norm(tip_b - side_2, dim=-1) ** 2
+    cost_ba = torch.norm(tip_a - side_2, dim=-1) ** 2 + torch.norm(tip_b - side_1, dim=-1) ** 2
+    finger_cost = torch.minimum(cost_ab, cost_ba)                                   # (B, T), m^2
+
+    cost = center_cost + wrist_cost + finger_cost
+    reward = -(cost * weights).sum(dim=1)
+    return reward.mean()  # MUST return scalar!

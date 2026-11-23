@@ -21,7 +21,7 @@ class FakeVLM:
         self.answers = list(answers)
         self.sent = []  # (trigger line, [image fill values]) per call
 
-    def __call__(self, prompt_text, images, call_dir, model, reasoning_effort):
+    def __call__(self, prompt_text, images, call_dir, model, reasoning_effort, ee_input):
         assert self.answers, f"unexpected VLM call: {call_dir}"
         trigger = [l for l in prompt_text.split("\n") if l.startswith("This call was triggered because:")][0]
         self.sent.append((trigger.split(": ", 1)[1], [int(img[0, 0, 0]) for img in images]))

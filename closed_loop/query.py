@@ -6,6 +6,7 @@ import time
 
 import cv2
 
+from closed_loop.ee_input import check_on_dummy_poses, wrap_for_poses
 from closed_loop.parse import parse_output
 from utils.guidance_utils import load_functions_from_txt
 from vlm_query.claude_code_client import query_claude_code
@@ -21,12 +22,13 @@ def _image_part(rgb):
     return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}}
 
 
-def run_call(prompt_text, images, call_dir, model, reasoning_effort):
+def run_call(prompt_text, images, call_dir, model, reasoning_effort, ee_input="position"):
     """
     Args:
         prompt_text: from closed_loop.prompt.build_prompt.
         images: list of (H, W, 3) uint8 RGB images, in the order the prompt describes them.
         call_dir: folder for this call's files (created; must not exist yet, so no run is overwritten).
+        ee_input: what the guidance function takes (closed_loop/ee_input.py); pose inputs get wrapped for pi05_steer.
     Returns:
         parse_output's dict, plus "guidance_fns" (loaded and checked on a dummy trajectory, or [] when no function)
         and "seconds" (VLM wall time).
@@ -58,8 +60,13 @@ def run_call(prompt_text, images, call_dir, model, reasoning_effort):
         function_path = os.path.join(call_dir, f"{parsed['function_name']}.txt")
         with open(function_path, "w") as f:
             f.write(parsed["function_source"] + "\n")
-        # Runs the function on a dummy trajectory and raises if it crashes or returns a non-tensor
-        guidance_fns = load_functions_from_txt(function_path, validate=True)
+        if ee_input == "position":
+            # Runs the function on a dummy trajectory and raises if it crashes or returns a non-tensor
+            guidance_fns = load_functions_from_txt(function_path, validate=True)
+        else:
+            guidance_fns = [wrap_for_poses(fn, ee_input) for fn in load_functions_from_txt(function_path, validate=False)]
+            for fn in guidance_fns:
+                check_on_dummy_poses(fn)
 
     saved = {k: v for k, v in parsed.items() if k != "function_source"}
     saved["model"] = model

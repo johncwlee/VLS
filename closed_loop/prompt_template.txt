@@ -31,16 +31,18 @@ You write a guidance function for ONE stage at a time: the stage the robot shoul
   **IMPORTANT:** Always remember that you are helping to "MAKE A CHOICE"—selecting the specific object to grasp or the specific location to place.
 
 %% >>> NEW: section heading only; the rules under it are VLS's, unchanged
-## Rules for guidance functions
+## Rules for guidance functionsof Planar Worlds with Distributed Consensus
 %% <<< END NEW
 **Note:**
-- Each guidance function takes a sequence of 3D points as the action sequence and a set of keypoints as input, and returns a scalar reward.
+{ee_input_summary}
 - **CRITICAL:** DO NOT create separate stages for gripper actions (closing/opening/releasing gripper). These are handled automatically by the low-level policy. Only create stages for spatial motion decisions (e.g., "move to grasp object", "move to place location").
 - Avoid using "if" statements in your guidance functions.
 - **IMPORTANT:** DO NOT add any obstacle avoidance or distractor penalties. The diffusion policy handles collision avoidance automatically. Only guide toward the target.
 - Inputs to the guidance function are as follows:
   - `keypoints`: torch.tensor of shape `(K, 3)` representing the keypoint positions in world frame.
-  - `action_sequence`: torch.tensor of shape `(B, T, 3)` representing the proposed end-effector trajectory in world frame, with first item in each batch representing current end-effector position.
+%% >>> CHANGED (2026-11-23): {ee_input_summary} and {ee_input_description} depend on main.closed_loop_ee_input
+{ee_input_description}
+%% <<< END CHANGED
 - Inside each function, you may use native Python functions and any PyTorch functions. Be careful to make sure that the output is differentiable with respect to the action_sequence.
 - **CRITICAL: DO NOT write "import torch" in any part of your output.**
 - In order to move a keypoint, its associated object must be grasped in one of the previous stages.
@@ -113,21 +115,8 @@ evidence = "..."       # one sentence: what you see that supports the verdict
 
 ### guidance for the current stage (only when verdict is plan, advance or replan, and guidance = yes)
 ### name it with the current stage number, e.g. stage2_guidance when current_stage = 2
-%% <<< END CHANGED (the example function body below is VLS's, unchanged)
-def stage1_guidance(keypoints, action_sequence):
-    # ALL code must be inside this function - no external helpers!
-    # Always use torch.where for weights to avoid memory sharing errors
-    T = action_sequence.shape[1]
-    timesteps = torch.arange(T, device=action_sequence.device)
-    final_start = int(0.7 * T)
-    weights = torch.where(timesteps >= final_start, torch.tensor(3.0, device=action_sequence.device), torch.tensor(1.0, device=action_sequence.device))
-    weights = weights / weights.sum()
-
-    target_idx = torch.tensor([0], dtype=torch.long, device=keypoints.device)
-    target_pos = keypoints[target_idx][0]
-    all_dists = torch.norm(action_sequence - target_pos, dim=-1)
-    reward = -(all_dists ** 2 * weights).sum(dim=1)
-    return reward.mean()  # MUST return scalar!
+%% <<< END CHANGED. {example_function}: closed_loop/example_<ee_input>.txt (example_position.txt is VLS's, unchanged)
+{example_function}
 ```
 
 ## Query
@@ -135,7 +124,7 @@ Query Task: "{instruction}"
 %% >>> NEW (closed-loop): trigger, gripper state, plan number, plan, history
 %%     Gripper line: the camera often can't show open/closed; VLS only said it through the trigger text (2026-11-18)
 This call was triggered because: {trigger_reason}
-Gripper: {gripper_state}
+Gripper: {gripper_state}{gripper_pose}
 
 Current plan (plan {plan_id}):
 {plan}

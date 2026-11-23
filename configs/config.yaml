@@ -36,6 +36,7 @@ main:
   vlm_query_limit: 50  # Max VLM queries per episode
   closed_loop_vls: false  # PLAN_closed_loop.md: the VLM re-checks and re-plans during the episode (closed_loop/); LIBERO only
   closed_loop_time_limit_chunks: 4  # chunks without a check before a time-limit check (pi0.5: 10 steps per chunk)
+  closed_loop_ee_input: position  # guidance fn input (closed_loop/ee_input.py): position (B,T,3) as VLS | pose (B,T+1,4,4) | gripper_points (B,T+1,4,3)
   guide_scale: 80.0  # fallback only; the LIBERO/CALVIN adapters set it per task
   start_ratio: null  # when diversity hands over to reward guidance (pi0.5: flow time, 1.0 = noise; diffusion: fraction of steps); null = policy default (pi0.5: 0.8)
   # Particle, diversity and FKD params: configs/guidance/<backend>.yaml

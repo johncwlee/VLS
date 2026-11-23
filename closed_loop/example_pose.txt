@@ -1,0 +1,28 @@
+def stage1_guidance(keypoints, ee_poses):
+    # ALL code must be inside this function - no external helpers!
+    # Example: grasp keypoint 0 from above, with the fingers closing along the line from keypoint 1 to keypoint 2
+    device = ee_poses.device
+    T = ee_poses.shape[1]
+    timesteps = torch.arange(T, device=device)
+    final_start = int(0.7 * T)
+    weights = torch.where(timesteps >= final_start, torch.tensor(3.0, device=device), torch.tensor(1.0, device=device))
+    weights = weights / weights.sum()
+
+    target_idx = torch.tensor([0], dtype=torch.long, device=keypoints.device)
+    target_pos = keypoints[target_idx][0]
+    position = ee_poses[..., :3, 3]                                   # (B, T, 3)
+    position_cost = torch.norm(position - target_pos, dim=-1) ** 2    # (B, T), m^2
+
+    down = torch.tensor([0.0, 0.0, -1.0], device=device)
+    approach = ee_poses[..., :3, 2]                                   # (B, T, 3)
+    approach_cost = 1.0 - (approach * down).sum(dim=-1)              # (B, T), 0 when aligned, up to 2
+
+    line = keypoints[2] - keypoints[1]
+    line = line / torch.norm(line)
+    finger_line = ee_poses[..., :3, 0]                               # (B, T, 3)
+    finger_cost = 1.0 - (finger_line * line).sum(dim=-1) ** 2        # (B, T), 0 when parallel (either sign), up to 1
+
+    # Orientation costs have no units; 0.01 makes 30 degrees of error cost about as much as 4 cm
+    cost = position_cost + 0.01 * (approach_cost + finger_cost)
+    reward = -(cost * weights).sum(dim=1)
+    return reward.mean()  # MUST return scalar!
