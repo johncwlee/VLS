@@ -10,7 +10,7 @@ LIBERO_NOTES_PATH = os.path.join(os.path.dirname(__file__), '..', 'vlm_query', '
 
 
 def new_closed_loop(call_root, instruction, start_image_kp, key_points_objects_map, model, reasoning_effort,
-                    time_limit_chunks, query_limit, reward_upper, reward_lower, ee_input="position"):
+                    time_limit_chunks, query_limit, reward_upper, reward_lower, ee_input="position", table_height_m=None):
     """
     The dict that start_episode and on_new_chunk update. No VLM call.
 
@@ -22,6 +22,7 @@ def new_closed_loop(call_root, instruction, start_image_kp, key_points_objects_m
         query_limit: main.vlm_query_limit; closed-loop calls count toward it.
         reward_upper, reward_lower: normalized-reward thresholds of the reward triggers (main.schmitt_upper / lower).
         ee_input: what the guidance function takes (main.closed_loop_ee_input, closed_loop/ee_input.py).
+        table_height_m: table surface z, world frame, meters (closed_loop/table_height.py); used by "pose" prompts.
     """
     with open(LIBERO_NOTES_PATH) as f:
         libero_notes = f.read()
@@ -36,6 +37,7 @@ def new_closed_loop(call_root, instruction, start_image_kp, key_points_objects_m
         "model": model,
         "reasoning_effort": reasoning_effort,
         "ee_input": ee_input,
+        "table_height_m": table_height_m,
         "time_limit_chunks": time_limit_chunks,
         "reward_upper": reward_upper,
         "reward_lower": reward_lower,
@@ -91,7 +93,7 @@ def start_episode(cl, keypoints, ee_pose_now=None):
                                history=[], trigger_reason="initial query", gripper_state="open",
                                key_points_objects_map=cl["key_points_objects_map"], keypoint_positions=keypoints,
                                task_specific_patterns=cl["task_notes"], ee_input=cl["ee_input"],
-                               ee_pose_now=ee_pose_now)
+                               ee_pose_now=ee_pose_now, table_height_m=cl["table_height_m"])
     _call(cl, prompt_text, [cl["start_image_kp"]], step=0, trigger="initial query", time_limit=False, reward_now=0.0)
 
 
@@ -153,7 +155,7 @@ def on_new_chunk(cl, step, gripper_open, reward, current_image_kp, keypoints, ee
                                    gripper_state="open" if gripper_open else "closed",
                                    key_points_objects_map=cl["key_points_objects_map"], keypoint_positions=keypoints,
                                    task_specific_patterns=cl["task_notes"], ee_input=cl["ee_input"],
-                                   ee_pose_now=ee_pose_now)
+                                   ee_pose_now=ee_pose_now, table_height_m=cl["table_height_m"])
         stage_changed = _call(cl, prompt_text, [cl["start_image_kp"], current_image_kp], step, text, is_time_limit,
                               reward)
     use_guidance = state["guidance"] and len(cl["guidance_fns"]) > 0

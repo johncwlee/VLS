@@ -37,7 +37,10 @@ You write a guidance function for ONE stage at a time: the stage the robot shoul
 {ee_input_summary}
 - **CRITICAL:** DO NOT create separate stages for gripper actions (closing/opening/releasing gripper). These are handled automatically by the low-level policy. Only create stages for spatial motion decisions (e.g., "move to grasp object", "move to place location").
 - Avoid using "if" statements in your guidance functions.
-- **IMPORTANT:** DO NOT add any obstacle avoidance or distractor penalties. The diffusion policy handles collision avoidance automatically. Only guide toward the target.
+%% >>> CHANGED (2026-11-24): {obstacle_rule} is VLS's "DO NOT add any obstacle avoidance" line, except for ee_input
+%%     "pose": there the gripper body must stay clear of the table and non-target objects (see prompt.py OBSTACLE_RULE)
+{obstacle_rule}
+%% <<< END CHANGED
 - Inputs to the guidance function are as follows:
   - `keypoints`: torch.tensor of shape `(K, 3)` representing the keypoint positions in world frame.
 %% >>> CHANGED (2026-11-23): {ee_input_summary} and {ee_input_description} depend on main.closed_loop_ee_input

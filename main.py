@@ -396,7 +396,7 @@ class Main:
         self.keypoint_id_to_object = key_points_objects_map  # Keypoint ID -> object name mapping
 
         if self.config.get('closed_loop_vls', False):
-            self._start_closed_loop(episode_dir, instruction, projected_img, key_points, key_points_objects_map)
+            self._start_closed_loop(episode_dir, instruction, projected_img, key_points, key_points_objects_map, points)
             return
 
         self.vlm_agent.task_dir = os.path.join(episode_dir, 'vlm_agent')     
@@ -460,10 +460,12 @@ class Main:
         return [float(env.sim.data.qpos[env.sim.model.joint_name2id(j)]) for j in finger_joints]
 
     def _start_closed_loop(self, episode_dir: str, instruction: str, projected_img: np.ndarray,
-                           key_points: np.ndarray, key_points_objects_map: dict) -> None:
+                           key_points: np.ndarray, key_points_objects_map: dict, points: np.ndarray) -> None:
         """main.closed_loop_vls: the first closed-loop call writes the plan and stage-1 guidance (closed_loop/run.py),
-        in place of vlm_agent.generate_guidance. projected_img: RGB start image with keypoints drawn."""
+        in place of vlm_agent.generate_guidance. projected_img: RGB start image with keypoints drawn.
+        points: (H, W, 3) world-frame point cloud of the start image, meters (table height for "pose" prompts)."""
         from closed_loop import run as closed_loop
+        from closed_loop.table_height import estimate_table_height_m
         vlm_cfg = self.cfg.perception.vlm_agent
         assert self.backend == 'libero', f"closed_loop_vls supports LIBERO only, got {self.backend}"
         assert self.grasp_steering is None, "closed_loop_vls with grasp steering is not supported"
@@ -472,7 +474,8 @@ class Main:
             os.path.join(episode_dir, 'closed_loop'), instruction, projected_img, key_points_objects_map,
             vlm_cfg.model, vlm_cfg.reasoning_effort, self.config.get('closed_loop_time_limit_chunks', 4),
             self.config.get('vlm_query_limit', 10), self.config.get('schmitt_upper', 0.8),
-            self.config.get('schmitt_lower', 0.6), self.config.get('closed_loop_ee_input', 'position'))
+            self.config.get('schmitt_lower', 0.6), self.config.get('closed_loop_ee_input', 'position'),
+            estimate_table_height_m(points))
         self.guidance_fns = {}  # filled per chunk by _closed_loop_step; _run_episode checks it exists
         closed_loop.start_episode(self.closed_loop, key_points, self.adapter._measure_ee())
 

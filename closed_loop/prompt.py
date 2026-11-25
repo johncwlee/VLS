@@ -29,6 +29,15 @@ EE_INPUT_DESCRIPTION = {
         "    - `ee_poses[..., :3, 2]`: approach direction, unit vector from the wrist toward the fingertips.",
         "    - Steering moves and rotates the gripper. A reward on position only leaves the orientation to the policy; "
         "add an orientation term when the stage needs the gripper in a particular orientation.",
+        # Box: Panda hand + finger collision geoms around the grip site (scratch/2026-11-24_target_pose_clearance.py);
+        # fingertips: body origins when open (notes/handoff.md)
+        "    - Gripper size: the gripper body fills this box in the end-effector frame (x along the finger line, "
+        "y along `ee_poses[..., :3, 1]`, z along the approach direction; origin at the gripper position), in meters: "
+        "x from -0.106 to 0.106, y from -0.032 to 0.032, z from -0.124 (wrist side) to 0.012 (fingertip side). "
+        "It is widest along the finger line: a finger line pointing toward the table or an obstacle needs about "
+        "0.11 m of free space on that side.",
+        "    - Open fingertips are at x = -0.0475 and x = 0.0475, y = 0, z = 0.011 in the same frame.",
+        "    - A point `p_ee` given in this frame is at `ee_poses[..., :3, :3] @ p_ee + ee_poses[..., :3, 3]` in world frame.",
     ]),
     "gripper_points": "\n".join([
         "  - `gripper_points`: torch.tensor of shape `(B, T, 4, 3)`: four points on the gripper in world frame, "
@@ -39,6 +48,33 @@ EE_INPUT_DESCRIPTION = {
         "    - `gripper_points[:, :, 3]`: wrist, 11 cm behind the gripper center, on the side away from the fingertips.",
         "    - Steering moves and rotates the gripper. A reward on the center only leaves the orientation to the policy; "
         "place the fingertips or the wrist relative to keypoints when the stage needs a particular orientation.",
+    ]),
+}
+VLS_OBSTACLE_RULE = ("- **IMPORTANT:** DO NOT add any obstacle avoidance or distractor penalties. The diffusion policy "
+                     "handles collision avoidance automatically. Only guide toward the target.")
+OBSTACLE_RULE = {
+    "position": VLS_OBSTACLE_RULE,
+    "gripper_points": VLS_OBSTACLE_RULE,
+    # 2026-11-24: task 0's best pose for a pose reward put the hand 5.2 cm into the table (gripper is 21 cm wide).
+    # Round 3 cm penalties around obstacle keypoints made the gripper dodge other handles in z and stall
+    # (outputs/t0i0_pose_clear_r*), so obstacles are now avoided by stages with a stated direction.
+    "pose": "\n".join([
+        "- **IMPORTANT:** The gripper is a solid body, not a point (its size is given below). Every pose you reward must "
+        "keep the whole gripper body above the table: add a penalty when points on the gripper body come within about "
+        "1 cm of the table surface. If the gripper body does not fit at the target in one orientation, choose an "
+        "orientation that fits.",
+        "- **IMPORTANT - obstacles:** when other objects or parts are next to the target or between the gripper and the "
+        "target (for example, other handles on the same cabinet), do not avoid them with distance penalties. Instead, "
+        "route the gripper around them with stages, and state the direction of motion in each stage description:",
+        "  - First a stage to a clear waypoint: a point offset from the target toward its free side (the side from "
+        "which the gripper can reach the target without touching anything else), for example 10 cm out from a cabinet "
+        "face along its outward direction, at the target's height. Name the direction (a world axis such as +Y, or a "
+        "vector between two keypoints) and the side of each obstacle the gripper passes on.",
+        "  - Then a stage that moves from the waypoint to the target in a straight line along that direction, with the "
+        "gripper already in the orientation it needs at the target. Penalize leaving the line, so the gripper body "
+        "does not swing into the obstacles.",
+        "- Contact without closing the gripper (pushing or pulling with the fingers) is allowed for sliding an object, "
+        "but not for picking an object up.",
     ]),
 }
 
@@ -76,7 +112,7 @@ def format_history(history):
     return "\n".join(lines)
 
 
-def format_gripper_pose(ee_input, ee_pose_now):
+def format_gripper_pose(ee_input, ee_pose_now, table_height_m=None):
     """The extra text after "Gripper: open/closed" in the Query section: none for "position"."""
     if ee_input == "position":
         return ""
@@ -84,7 +120,8 @@ def format_gripper_pose(ee_input, ee_pose_now):
     if ee_input == "pose":
         return (f"\nGripper pose now: position {np.round(ee_pos_world_m, 3).tolist()}, "
                 f"finger line {np.round(R_world_ee[:, 0], 2).tolist()}, "
-                f"approach direction {np.round(R_world_ee[:, 2], 2).tolist()}")
+                f"approach direction {np.round(R_world_ee[:, 2], 2).tolist()}"
+                f"\nTable surface height (estimated from the depth image): z = {table_height_m:.3f} m")
     pose = np.eye(4)
     pose[:3, :3] = R_world_ee
     pose[:3, 3] = ee_pos_world_m
@@ -94,7 +131,8 @@ def format_gripper_pose(ee_input, ee_pose_now):
 
 
 def build_prompt(mode, instruction, plan, plan_id, current_stage, history, trigger_reason, gripper_state,
-                 key_points_objects_map, keypoint_positions, task_specific_patterns, ee_input="position", ee_pose_now=None):
+                 key_points_objects_map, keypoint_positions, task_specific_patterns, ee_input="position", ee_pose_now=None,
+                 table_height_m=None):
     """
     Args:
         mode: "first" (make a plan) or "check" (judge the current stage).
@@ -110,9 +148,11 @@ def build_prompt(mode, instruction, plan, plan_id, current_stage, history, trigg
         task_specific_patterns: environment notes, e.g. vlm_query/guidance_template_libero.txt.
         ee_input: what the guidance function gets (closed_loop/ee_input.py EE_INPUTS).
         ee_pose_now: (ee_pos_world_m (3,), R_world_ee (3, 3)) measured now; needed unless ee_input is "position".
+        table_height_m: table surface z in world frame, meters (closed_loop/table_height.py); needed for "pose".
     """
     assert ee_input in EE_INPUTS, f"unknown ee_input {ee_input!r}"
     assert ee_input == "position" or ee_pose_now is not None, f"ee_input {ee_input!r} needs ee_pose_now"
+    assert ee_input != "pose" or table_height_m is not None, "ee_input 'pose' needs table_height_m"
     assert mode in ("first", "check"), f"unknown mode {mode!r}"
     assert gripper_state in ("open", "closed"), f"gripper_state must be 'open' or 'closed', got {gripper_state!r}"
     if mode == "check":
@@ -142,9 +182,13 @@ def build_prompt(mode, instruction, plan, plan_id, current_stage, history, trigg
         "{image_description}": image_description,
         "{ee_input_summary}": EE_INPUT_SUMMARY[ee_input],
         "{ee_input_description}": EE_INPUT_DESCRIPTION[ee_input],
+        "{obstacle_rule}": OBSTACLE_RULE[ee_input],
         "{example_function}": _read(f"example_{ee_input}.txt").rstrip("\n"),
-        "{gripper_pose}": format_gripper_pose(ee_input, ee_pose_now),
+        "{gripper_pose}": format_gripper_pose(ee_input, ee_pose_now, table_height_m),
     }
+    if ee_input == "pose":
+        # After {example_function}: example_pose.txt uses the estimated table height
+        replacements["{table_z}"] = f"{table_height_m:.3f}"
     for placeholder, value in replacements.items():
         prompt_text = prompt_text.replace(placeholder, value)
     return prompt_text

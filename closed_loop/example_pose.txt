@@ -1,6 +1,8 @@
-def stage1_guidance(keypoints, ee_poses):
+def stage2_guidance(keypoints, ee_poses):
     # ALL code must be inside this function - no external helpers!
-    # Example: grasp keypoint 0 from above, with the fingers closing along the line from keypoint 1 to keypoint 2
+    # Example plan: stage 1 moved the gripper to a clear waypoint 10 cm from keypoint 0 along free_dir (keypoint 4 is an
+    # obstacle on the other side). This stage 2 moves straight in to keypoint 0 along -free_dir, fingers closing along
+    # the line from keypoint 1 to keypoint 2, and keeps the gripper body above the table
     device = ee_poses.device
     T = ee_poses.shape[1]
     timesteps = torch.arange(T, device=device)
@@ -11,18 +13,37 @@ def stage1_guidance(keypoints, ee_poses):
     target_idx = torch.tensor([0], dtype=torch.long, device=keypoints.device)
     target_pos = keypoints[target_idx][0]
     position = ee_poses[..., :3, 3]                                   # (B, T, 3)
-    position_cost = torch.norm(position - target_pos, dim=-1) ** 2    # (B, T), m^2
 
-    down = torch.tensor([0.0, 0.0, -1.0], device=device)
+    # Free direction: from the obstacle side toward free space (here from keypoint 4 to keypoint 0)
+    free_dir = keypoints[0] - keypoints[4]
+    free_dir = free_dir / torch.norm(free_dir)
+    rel = position - target_pos                                       # (B, T, 3)
+    along = (rel * free_dir).sum(dim=-1)                              # (B, T), m out from the target along free_dir
+    lateral = rel - along.unsqueeze(-1) * free_dir                    # (B, T, 3), off the approach line
+    along_cost = along ** 2                                           # (B, T), m^2
+    line_cost = (lateral ** 2).sum(dim=-1)                            # (B, T), m^2
+    past_target_cost = torch.relu(-along) ** 2                        # (B, T), m^2: moving past the target into it
+
     approach = ee_poses[..., :3, 2]                                   # (B, T, 3)
-    approach_cost = 1.0 - (approach * down).sum(dim=-1)              # (B, T), 0 when aligned, up to 2
+    approach_cost = 1.0 - (approach * -free_dir).sum(dim=-1)          # (B, T), 0 when pointing in along -free_dir
 
     line = keypoints[2] - keypoints[1]
     line = line / torch.norm(line)
     finger_line = ee_poses[..., :3, 0]                               # (B, T, 3)
     finger_cost = 1.0 - (finger_line * line).sum(dim=-1) ** 2        # (B, T), 0 when parallel (either sign), up to 1
 
-    # Orientation costs have no units; 0.01 makes 30 degrees of error cost about as much as 4 cm
-    cost = position_cost + 0.01 * (approach_cost + finger_cost)
+    # Points on the gripper body box (end-effector frame, meters), mapped to world frame
+    body_ee = torch.tensor([[x, y, z] for x in (-0.106, -0.053, 0.0, 0.053, 0.106)
+                            for y in (-0.032, 0.032) for z in (-0.124, 0.012)], device=device)   # (20, 3)
+    body = torch.einsum('btij,nj->btni', ee_poses[..., :3, :3], body_ee) + position.unsqueeze(2)  # (B, T, 20, 3)
+
+    # Table surface height from the query; keep the body 1 cm above it
+    table_z = {table_z}
+    table_cost = (torch.relu(table_z + 0.01 - body[..., 2]) ** 2).sum(dim=-1)          # (B, T), m^2
+
+    # Orientation costs have no units; 0.01 makes 30 degrees of error cost about as much as 4 cm.
+    # Leaving the line weighs 3x and the table 10x, so the gripper comes in straight and stays above the table.
+    cost = (along_cost + 3.0 * line_cost + 10.0 * past_target_cost + 0.01 * (approach_cost + finger_cost)
+            + 10.0 * table_cost)
     reward = -(cost * weights).sum(dim=1)
     return reward.mean()  # MUST return scalar!
