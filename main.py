@@ -95,13 +95,14 @@ def _require_cuda(cfg: dict):
 
 
 class Main:
-    def __init__(self, cfg: DictConfig, policy=None):
+    def __init__(self, cfg: DictConfig, policy=None, adapter=None):
         """
         Initialize with Hydra DictConfig.
 
         Args:
             cfg: Hydra configuration (OmegaConf DictConfig)
             policy: an already loaded steering policy to use instead of loading policy.<type>.pretrained_path
+            adapter: an existing env adapter (possibly mid-episode) to use instead of creating one
         """
         self.cfg = cfg
         self.config = cfg.main  # Shortcut to main config section
@@ -139,7 +140,7 @@ class Main:
         log.info(f"EE path prediction model: {env_config.get('ee_prediction', 'adapter default')}")
 
         # Create adapter
-        self.adapter = create_adapter(self.backend, env_config)
+        self.adapter = adapter if adapter is not None else create_adapter(self.backend, env_config)
         
         # Get task info from adapter for guidance adjustment
         task_info = self.adapter.get_task_info()
@@ -319,7 +320,7 @@ class Main:
         processed_observation = self.policy_preprocessor(observation)
         return processed_observation
     
-    def perform_task_for_episode(self, episode_dir: str):
+    def perform_task_for_episode(self, episode_dir: str, failure_context: str = "", before_image: str = ""):
         """Prepare for each episode (keypoint detection, guidance generation, etc.)"""
         from utils.guidance_utils import load_functions_from_txt
 
@@ -414,7 +415,9 @@ class Main:
             metadata = {
                 'init_keypoint_positions': key_points, 
                 'num_keypoints': len(key_points), 
-                'key_points_objects_map': key_points_objects_map
+                'key_points_objects_map': key_points_objects_map,
+                'failure_context': failure_context,
+                'before_image': before_image,  # path: the scene at the start of the attempt (recovery)
             }
             guidance_functions_dir = self.vlm_agent.generate_guidance(
                 projected_img, instruction, metadata

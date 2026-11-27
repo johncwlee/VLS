@@ -92,6 +92,14 @@ def stage2_guidance(keypoints, action_sequence):
 
 ## Query
 Query Task: "{instruction}"
+
+**RECOVERY - this attempt is already in progress and a failure was detected:**
+The robot's base policy has been executing this task on its own, without guidance. A failure detector watching the camera raised an alarm, and you are now asked to take over for the rest of the attempt.
+Failure detector report: {failure_context}
+- The query image and the keypoint positions show the CURRENT state at the moment of the alarm, NOT the start of the task. Objects may already have been moved, and the gripper may be holding something.
+- The report is a hint from an imperfect detector, not ground truth. First work out from the image what actually went wrong: is the gripper holding or reaching for an object the task does not name, was an object dropped or knocked over, was an object carried to or put in the wrong place, or is the arm stuck without progress?
+- Then write stages that recover from the current state and finish the task. If something must be undone first (for example, release a wrong object away from the target, or pick a misplaced object up again), make that the first stage(s). Do not repeat parts of the task that are already correctly done.
+- Stage 1 is the first thing the robot should do from now on. Few steps remain, so keep the recovery short and direct.
 Keypoints to object name map: "{key_points_objects_map}"
 Keypoint 3D positions [X, Y, Z]: "{init_keypoint_positions}"
 

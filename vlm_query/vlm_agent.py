@@ -139,6 +139,7 @@ class VLMAgent:
             "{key_points_objects_map}": str(kwargs.get('key_points_objects_map', '')),
             "{init_keypoint_positions}": str(kwargs.get('init_keypoint_positions', '')),
             "{num_keypoints}": str(kwargs.get('num_keypoints', '')),
+            "{failure_context}": str(kwargs.get('failure_context', '')),
         }
         
         for placeholder, value in replacements.items():
@@ -149,24 +150,17 @@ class VLMAgent:
             with open(os.path.join(save_dir, 'prompt.txt'), 'w', encoding='utf-8') as f:
                 f.write(prompt_text)
         
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt_text
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{img_base64}"
-                        }
-                    },
-                ]
-            }
-        ]
-        return messages
+        def image(b64):
+            return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+
+        content = [{"type": "text", "text": prompt_text}, image(img_base64)]
+        if kwargs.get('before_image'):  # recovery: the scene before the base policy moved anything
+            content = [{"type": "text", "text": prompt_text},
+                       {"type": "text", "text": "BEFORE image - the scene at the start of the attempt, before the "
+                        "robot moved (no keypoints):"}, image(encode_image(kwargs['before_image'])),
+                       {"type": "text", "text": "CURRENT image - the scene now, at the alarm, with the keypoints. "
+                        "This is the query image; all keypoint indices and positions refer to it:"}, image(img_base64)]
+        return [{"role": "user", "content": content}]
 
     def _parse_and_save_guidance_functions(self, output, save_dir):
         # parse into function blocks

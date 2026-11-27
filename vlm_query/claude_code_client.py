@@ -84,8 +84,15 @@ def query_anthropic_api(parts: list, model: str, reasoning_effort: str | None = 
     elif reasoning_effort is not None:
         body["thinking"] = {"type": "adaptive"}
         body["output_config"] = {"effort": reasoning_effort}
-    response = httpx.post("https://api.anthropic.com/v1/messages", json=body, timeout=600,
-                          headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"})
+    for attempt in range(3):  # a dropped connection (seen 2026-11-20: SSL EOF) is retried; HTTP errors are not
+        try:
+            response = httpx.post("https://api.anthropic.com/v1/messages", json=body, timeout=600,
+                                  headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"})
+            break
+        except httpx.TransportError as e:
+            if attempt == 2:
+                raise
+            log.warning(f"[Anthropic API] {type(e).__name__}: {e}; retrying")
     if response.status_code != 200:
         raise RuntimeError(f"Anthropic API returned HTTP {response.status_code}: {response.text[:500]}")
     data = response.json()

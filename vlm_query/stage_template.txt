@@ -58,7 +58,7 @@ Interpret the trigger:
 
 ## Images
 You will be provided with:
-1. **Initial Image (with keypoints)**: The starting state with numbered markers on objects.
+1. **Initial Image (with keypoints)**: The state when this recovery started (a failure of the base policy was detected mid-task and the stages below were written to recover from it and finish the task), with numbered markers on objects.
 2. **Current Image**: The current robot state AFTER the trigger event.
 
 ---
