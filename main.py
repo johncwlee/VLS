@@ -95,12 +95,13 @@ def _require_cuda(cfg: dict):
 
 
 class Main:
-    def __init__(self, cfg: DictConfig):
+    def __init__(self, cfg: DictConfig, policy=None):
         """
         Initialize with Hydra DictConfig.
-        
+
         Args:
             cfg: Hydra configuration (OmegaConf DictConfig)
+            policy: an already loaded steering policy to use instead of loading policy.<type>.pretrained_path
         """
         self.cfg = cfg
         self.config = cfg.main  # Shortcut to main config section
@@ -167,15 +168,17 @@ class Main:
         pretrained_path = type_config.get('pretrained_path', 'Vision-Language-Steering/vls_calvin_base')
         log.info(f"Loading {policy_type} from: {pretrained_path}")
         
-        if policy_type == 'diffusion':
+        self.device = cfg.get('device', 'cuda')
+        if policy is not None:  # residual.train (online.vls_source=live): its loaded weights, already on the device
+            self.policy = policy
+        elif policy_type == 'diffusion':
             self.policy = DiffusionPolicySteer.from_pretrained(pretrained_path)
         elif policy_type == 'pi05':
             self.policy = PI05PolicySteer.from_pretrained(pretrained_path)
         else:
             raise ValueError(f"Unknown policy type: {policy_type}")
-        
-        self.device = cfg.get('device', 'cuda')
-        self.policy.to(self.device)
+        if policy is None:
+            self.policy.to(self.device)
 
         preprocessor_overrides = {
             "device_processor": {"device": str(self.policy.config.device)},
@@ -529,10 +532,23 @@ class Main:
         vlm_clients = [c for c in (self.gemini_grounder, self.gemini_stage_recognizer, self.vlm_agent) if c is not None]
 
         start_episode = self.config.get('start_episode', 0)
+        eval_seed = self.config.get('eval_seed')
+        if eval_seed is not None:
+            from types import SimpleNamespace
+            from residual.train import eval_seed as residual_eval_seed
+            lib = self.cfg.backend.libero
+            ids = lib.get('task_ids_filter')
+            if (self.backend != 'libero' or ids is None or len(ids) != 1
+                    or lib.get('init_state_mode') != 'official' or lib.get('init_state_dir')):
+                raise ValueError("main.eval_seed needs backend libero, one task_ids_filter id, official inits "
+                                 "and no init_state_dir (episode i must run official init i)")
+            eval_task = SimpleNamespace(suite=lib.suite_name, task_id=int(ids[0]))
         for episode in range(start_episode, episode_num):
             for client in vlm_clients:
                 client.errors.clear()
             episode_seed = torch.randint(0, 1000, (1,)).item()
+            if eval_seed is not None:
+                episode_seed = residual_eval_seed(eval_seed, eval_task, "official", episode) % 2 ** 32
             self.policy.reset()
             self.video_recorder.clear()
             episode_dir = os.path.join(base_output_dir, f'episode_{episode+1}')
@@ -668,14 +684,17 @@ class Main:
     def _record_chunk(self, unsteered) -> None:
         """Append the chunk just sampled as one replay-buffer row of the residual (residual/buffer.py): the
         observation it was sampled from, the executed normalized chunk (a_exec) and pi0.5's chunk from the same
-        initial noise (a_base: the unsteered twin of the executed particle; the chunk itself when not steered).
+        initial noise (a_base: the unsteered twin of the executed particle; when not steered, the chunk itself
+        before the policy's action_edit, if any).
         """
         from residual.rollout import snapshot
         image, image2, state = snapshot(self.adapter.get_policy_observation(sample_num=1))
         horizon = self.policy._action_chunk_horizon  # an unguided sample is the full 50-step chunk
         executed = self.policy._cached_action_chunk[0, :horizon]
         steered = unsteered is not None
-        base = unsteered[self.policy.last_chunk_stats.get('executed_ancestor', 0), :horizon] if steered else executed
+        raw = getattr(self.policy, '_raw_action_chunk', None)
+        base = (unsteered[self.policy.last_chunk_stats.get('executed_ancestor', 0), :horizon] if steered
+                else executed if raw is None else raw[0, :horizon])
         for key, value in (('image', image[0]), ('image2', image2[0]), ('state', state[0]),
                            ('a_exec', executed.float().cpu().numpy()), ('a_base', base.float().cpu().numpy()),
                            ('steered', steered)):
@@ -689,8 +708,11 @@ class Main:
         out_dir = os.path.join(self.config.record_dir, self.adapter.suite_name, f"task{reset_info['task_id']}")
         os.makedirs(out_dir, exist_ok=True)
         name = f"init{reset_info['init_state_id']}_{'success' if success else 'fail'}.npz"
-        np.savez_compressed(os.path.join(out_dir, name), **rows, terminal=terminal, success=terminal & success,
-                            init_id=reset_info['init_state_id'], seed=seed, steps=self.episode_steps)
+        tmp = os.path.join(out_dir, name + '.tmp')  # a reader (residual.train) never sees a half-written episode
+        with open(tmp, 'wb') as f:
+            np.savez_compressed(f, **rows, terminal=terminal, success=terminal & success,
+                                init_id=reset_info['init_state_id'], seed=seed, steps=self.episode_steps)
+        os.replace(tmp, os.path.join(out_dir, name))
         log.info(f"Recorded {len(terminal)} chunks to {os.path.join(out_dir, name)}")
 
     def _gripper_close_record(self, step: int, stage: int, use_guidance: bool, ee_pos: np.ndarray,

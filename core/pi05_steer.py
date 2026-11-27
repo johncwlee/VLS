@@ -44,6 +44,12 @@ class PI05PolicySteer(PI05Policy):
         self._last_scale = 0.0
         self.last_chunk_stats = {}  # per-chunk guidance stats from the last guided sample (chunks.jsonl)
         self._pending_noise = None  # initial noise shared by sample_unsteered and the next guided sample
+        # residual.train (online.vls_source=live): (batch, chunk index) -> edit of normalized [B, H, A] samples
+        # (pi0.5 + residual). Guidance then scores the edited actions, and the edited chunk is executed.
+        self.action_edit = None
+        self._edit = None  # the current chunk's edit
+        self._chunk_index = 0
+        self._raw_action_chunk = None  # the last chunk before the edit
 
     def post_init(
         self,
@@ -65,6 +71,7 @@ class PI05PolicySteer(PI05Policy):
         self._stage_init_reward = None
         self._last_normalized_reward = 0.0
         self._last_scale = 0.0
+        self._chunk_index = 0
     
     def reset_stage(self):
         """Reset stage-specific state (call when stage changes)."""
@@ -108,6 +115,8 @@ class PI05PolicySteer(PI05Policy):
             batch.pop(ACTION)
 
         if generate_new_chunk:
+            self._edit = self.action_edit(batch, self._chunk_index) if self.action_edit is not None else None
+            self._chunk_index += 1
             if use_guidance and guidance_fns:
                 action_chunk = self._sample_actions_guided(
                     batch=batch,
@@ -130,6 +139,9 @@ class PI05PolicySteer(PI05Policy):
                 self._pending_noise = None  # an unsteered twin is only paired with a guided chunk
                 action_chunk = self.predict_action_chunk(batch)
             
+            self._raw_action_chunk = action_chunk
+            if self._edit is not None:
+                action_chunk = self._edit(action_chunk)
             self._cached_action_chunk = action_chunk
         else:
             action_chunk = self._cached_action_chunk
@@ -384,6 +396,8 @@ class PI05PolicySteer(PI05Policy):
             raise RuntimeError("Call post_init() first")
         
         device, dtype = sample.device, sample.dtype
+        if self._edit is not None:
+            sample = self._edit(sample)
         actions = self._postprocessor(sample).to(device, dtype)
         batch_size = sample.shape[0]
 
@@ -409,6 +423,8 @@ class PI05PolicySteer(PI05Policy):
             raise RuntimeError("Call post_init() first")
 
         device, dtype = sample.device, sample.dtype
+        if self._edit is not None:
+            sample = self._edit(sample)
         actions = self._postprocessor(sample).to(device, dtype)
         actions = self._adapter.env_postprocessor({"action": actions})["action"]
         return self._adapter.delta_actions_to_ee_poses(actions[:, :self._action_chunk_horizon]).to(device, dtype)

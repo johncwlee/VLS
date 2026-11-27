@@ -25,6 +25,9 @@ seed: 0
 main:
   episode_num: 10  # if using libero, need to be divisible by the number of tasks in the suite(i.e. libero_goal_task has 10 tasks, so episode_num should be divisible by 10)
   start_episode: 0  # resume: skip the first N episodes (N = "episode" of the last line in trials.jsonl); stats cover only the episodes run
+  # LIBERO, one task, official inits: seed each reset like residual.train's eval (eval.seed = this value), so episode i
+  # runs the same scene (init i + fixture poses) as the residual eval's "official" item i. null = random episode seeds
+  eval_seed: null
   output_dir: ${hydra:run.dir}
   cached_functions_dir: null
   debug_draw_trajectory: true
@@ -50,7 +53,7 @@ main:
   log_steps: false
   # Residual expert data (pi0.5 on LIBERO): save every episode as one .npz of replay-buffer rows (residual/buffer.py:
   # images, state, executed chunk, pi0.5's chunk from the same noise, steered flag) under
-  # <record_dir>/<suite>/task<id>/, read by residual.train's offline.expert_dir. +1 pi0.5 sample per guided chunk.
+  # <record_dir>/<suite>/task<id>/, read by residual.train's offline.expert_dir and online.vls_dir. +1 pi0.5 sample per guided chunk.
   # Use with backend.libero.init_state_dir so the data comes from train inits. Relative to modules/VLS. null = off
   record_dir: null
   # Action -> predicted EE path model (backend.<name>.ee_prediction): null = the backend's default, except

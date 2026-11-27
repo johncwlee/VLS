@@ -31,10 +31,12 @@ from datetime import timedelta
 from pathlib import Path
 
 import hydra
+import hydra.core.global_hydra
 import numpy as np
 import torch
 import torch.distributed as dist
 from hydra.core.hydra_config import HydraConfig
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.utils.random_utils import set_seed
 
 from residual.buffer import ReplayBuffer, chunk_reward, field_specs
@@ -99,7 +101,26 @@ class Trainer:
             raise SystemExit("policy.residual_ckpt is for mode=eval; continue a run with train.resume_dir, reuse "
                              "baseline outcomes with eval.baseline_ckpt")
         self.cpu_group = dist.new_group(backend="gloo", timeout=DIST_TIMEOUT) if self.world > 1 else None
-        self.pi05 = Pi05(cfg.policy.pretrained_path, cfg.device)
+        online = cfg.online
+        if (online.vls_source not in ("none", "recorded", "live") or online.vls_pool not in ("both", "online")
+                or not 0 <= online.on_policy_ratio <= 1):
+            raise SystemExit(f"online.vls_source={online.vls_source!r} (none, recorded or live), online.vls_pool="
+                             f"{online.vls_pool!r} (both or online), online.on_policy_ratio={online.on_policy_ratio} "
+                             "(0 to 1)")
+        n = online.episodes_per_task
+        # VLS episodes per task in an online round; the policy collects the other n - vls_per_task
+        self.vls_per_task = 0 if online.vls_source == "none" or cfg.mode == "eval" else n - round(n * online.on_policy_ratio)
+        if self.vls_per_task and cfg.offline.source == "vls" and online.vls_pool == "both":
+            raise SystemExit("offline.source=vls with online.vls_pool=both: the rounds' VLS episodes would be added to "
+                             "an offline pool that is already VLS data. Use offline.source=pi05 or online.vls_pool=online")
+        policy_cls = PI05Policy
+        if self.vls_per_task and online.vls_source == "live":
+            if cfg.actor.mode != "action_residual":  # the agent is not built yet
+                raise SystemExit("online.vls_source=live needs actor.mode=action_residual: VLS steers π0.5 + the action "
+                                 "residual")
+            # No extra weights: live VLS episodes run on this π0.5 instead of loading a second copy
+            from core.pi05_steer import PI05PolicySteer as policy_cls
+        self.pi05 = Pi05(cfg.policy.pretrained_path, cfg.device, policy_cls)
         self.dims = self.pi05.dims(cfg.policy.exec_horizon, cfg.policy.num_inference_steps)
         self.envs = EnvPool(cfg.env.max_open_envs)
         self.tasks = self._make_tasks()
@@ -301,20 +322,8 @@ class Trainer:
             for path in sorted(task_dir.glob("*_success.npz")):
                 if self.buffer.episode_count(expert=path.name, suite=task.suite, task=task.task_id):
                     continue
-                data = np.load(path)
-                n = len(data["a_exec"])
-                chunks = {k: data[k] for k in ("image", "image2", "state", "steered", "terminal", "success")}
-                chunks.update(task=np.full(n, task.index, dtype=np.int16), step=np.arange(n, dtype=np.int16))
-                ctx = self._context(chunks)
-                chunks.update({k: self.agent.clip(torch.from_numpy(data[k]).to(cfg.device)).cpu().numpy()
-                               for k in ("a_exec", "a_base")},
-                              h_prefix=ctx.h_prefix.float().cpu().numpy().astype(np.float16),
-                              state_norm=ctx.state.cpu().numpy())
                 slot = len(self.buffer.episodes)
-                meta = {"stage": 0, "round": 0, "suite": task.suite, "task": task.task_id, "expert": path.name,
-                        "init_id": int(data["init_id"]), "success": True, "steps": int(data["steps"]),
-                        "label_source": LABEL_SOURCE}
-                self.buffer.add_episode(chunks, meta, online=False, heldout=bool(
+                self._add_vls_episode(task, path, rnd=0, online=False, heldout=bool(
                     np.random.default_rng([cfg.seed, slot]).random() < cfg.offline.heldout_frac))
         if self.rank == 0:
             if not self.buffer.size:
@@ -324,6 +333,145 @@ class Trainer:
         self._barrier()
         if self.rank > 0:
             self.buffer.reload()
+
+    def _add_vls_episode(self, task: Task, path: Path, *, rnd: int, online: bool, heldout: bool,
+                         protected: bool | None = None) -> None:
+        """One episode recorded by VLS (main.py, main.record_dir) into the buffer, as stage 0. Features are
+        recomputed from the recorded images."""
+        data = np.load(path)
+        n = len(data["a_exec"])
+        chunks = {k: data[k] for k in ("image", "image2", "state", "steered", "terminal", "success")}
+        chunks.update(task=np.full(n, task.index, dtype=np.int16), step=np.arange(n, dtype=np.int16))
+        ctx = self._context(chunks)
+        chunks.update({k: self.agent.clip(torch.from_numpy(data[k]).to(self.cfg.device)).cpu().numpy()
+                       for k in ("a_exec", "a_base")},
+                      h_prefix=ctx.h_prefix.float().cpu().numpy().astype(np.float16),
+                      state_norm=ctx.state.cpu().numpy())
+        meta = {"stage": 0, "round": rnd, "suite": task.suite, "task": task.task_id, "expert": path.name,
+                "init_id": int(data["init_id"]), "success": bool(data["success"][-1]), "steps": int(data["steps"]),
+                "label_source": LABEL_SOURCE}
+        self.buffer.add_episode(chunks, meta, online=online, heldout=heldout, protected=protected)
+
+    # ---------------------------------------------------------------- VLS episodes in the online rounds
+    def _vls_files(self, task: Task) -> tuple[list[Path], int]:
+        """The task's VLS episodes under online.vls_dir: (those no round has imported yet, in init order; the first
+        init id without a file)."""
+        def init_id(path: Path) -> int:
+            return int(path.name[len("init"):].split("_")[0])
+        files = sorted((Path(self.cfg.online.vls_dir) / task.suite / f"task{task.task_id}").glob("init*.npz"), key=init_id)
+        used = {ep["expert"] for ep in self.buffer.episodes
+                if ep["online"] and "expert" in ep and (ep["suite"], ep["task"]) == (task.suite, task.task_id)}
+        return [p for p in files if p.name not in used], init_id(files[-1]) + 1 if files else 0
+
+    def _check_vls_supply(self) -> None:
+        """Before anything is collected: every task has VLS episodes for all rounds (live: or train inits left to
+        record them from)."""
+        cfg = self.cfg
+        if cfg.offline.source == "vls" and Path(cfg.online.vls_dir).resolve() == Path(cfg.offline.expert_dir).resolve():
+            raise SystemExit("offline.source=vls: online.vls_dir must be another directory than offline.expert_dir, "
+                             "or the offline pool's episodes would be stored again in the rounds")
+        vls_rounds = cfg.online.rounds - (cfg.actor.warmup_rounds if self.action_mode else 0)  # none in warm-up
+        need, short = max(0, vls_rounds) * self.vls_per_task, []
+        for task in self.tasks:
+            unused, next_init = self._vls_files(task)
+            have = len(unused) + sum(ep["online"] and "expert" in ep and ep["task"] == task.task_id
+                                     and ep["suite"] == task.suite for ep in self.buffer.episodes)
+            if cfg.online.vls_source == "live":
+                have += len(task.train_inits) - next_init
+            if have < need:
+                short.append(f"{task.label}: {have}/{need}")
+        if short:
+            raise SystemExit(f"online.vls_source={cfg.online.vls_source}: too few VLS episodes under {cfg.online.vls_dir} "
+                             f"for {vls_rounds} rounds x {self.vls_per_task} per task ({', '.join(short)}). "
+                             "Record more (VLS main.py, main.record_dir), or lower online.rounds or raise "
+                             "online.on_policy_ratio")
+        if self.rank == 0:
+            if cfg.online.vls_source == "recorded":
+                log.warning("online.vls_source=recorded: these VLS episodes steered plain π0.5, not π0.5 + the residual "
+                            "this run trains; live records them with the current residual")
+            log.info(f"Online rounds: {cfg.online.episodes_per_task - self.vls_per_task} policy + {self.vls_per_task} VLS "
+                     f"({cfg.online.vls_source}) episodes per task, after the warm-up rounds, VLS chunks in the "
+                     f"{'protected and online pools' if cfg.online.vls_pool == 'both' else 'online pool'}")
+
+    def collect_vls(self, rnd: int) -> None:
+        """The round's VLS share: per task the next unused episodes under online.vls_dir, success or failure, as
+        online episodes (never held out: the gate's online metrics are about the policy's exploration noise).
+        vls_source=live records the missing files first, in waves of one task per rank like collect()."""
+        cfg = self.cfg
+
+        def missing(task: Task) -> int:  # counted from the buffer, so a resumed round only tops up
+            return self.vls_per_task - self.buffer.episode_count(stage=0, round=rnd, suite=task.suite, task=task.task_id)
+        short = [t for t in self.tasks if missing(t) > 0]
+        if cfg.online.vls_source == "live":
+            torch.cuda.reset_peak_memory_stats()
+            for done in range(0, len(short), self.world):
+                if done + self.rank < len(short):
+                    self._record_vls(short[done + self.rank], missing(short[done + self.rank]))
+                self._barrier()
+            if self.rank == 0:
+                self.monitor.log({"round/vls_gpu_mem_peak_gb": torch.cuda.max_memory_allocated() / 2 ** 30}, **self.axes())
+            torch.cuda.reset_peak_memory_stats()  # update/time/gpu_mem_peak_gb is about the updates
+        for task in short if self.rank == 0 else []:
+            for path in self._vls_files(task)[0][:missing(task)]:
+                self._add_vls_episode(task, path, rnd=rnd, online=True, heldout=False,
+                                      protected=cfg.online.vls_pool == "both")
+        if self.rank == 0:
+            log.info(f"Collect round {rnd}: {self.buffer.episode_count(stage=0, round=rnd)} VLS episodes, "
+                     f"{self.buffer.size} chunks")
+        self._barrier()
+        if self.rank > 0:
+            self.buffer.reload()
+
+    def _vls_action_edit(self, task: Task):
+        """PI05PolicySteer.action_edit: VLS steers and executes π0.5 + the current residual (no exploration noise)
+        instead of plain π0.5. The recorded a_base stays π0.5's chunk."""
+        n, a_dim = self.dims.exec_horizon, self.dims.action_dim
+
+        def for_chunk(batch: dict, chunk: int):
+            first = {k: v[:1] for k, v in batch.items() if isinstance(v, (torch.Tensor, list))}  # VLS repeats the
+            feat = self.agent.feat(self.pi05.context(first, torch.tensor([chunk / task.t_max])))  # obs per particle
+
+            def edit(sample: torch.Tensor) -> torch.Tensor:  # normalized [B, H, A]; differentiable in sample
+                a_base = self.agent.clip(sample[:, :n, :a_dim])
+                a = self.agent.clip(a_base + self.agent.actor(feat.expand(len(sample), -1), a_base))
+                return torch.cat([a.to(sample.dtype), sample[:, n:, :a_dim]], dim=1)
+            return edit
+        return for_chunk
+
+    def _record_vls(self, task: Task, need: int) -> None:
+        """online.vls_source=live: VLS (main.py) records episodes of the task into online.vls_dir until `need` unused
+        ones exist, in this process, on self.pi05's weights and steering π0.5 + the current residual. VLS drops an
+        episode on a VLM or execution error without raising, so the files are the measure of success."""
+        import main as vls  # only here: its VLM client is not installed where live cannot run (cluster image)
+        cfg = self.cfg
+        self.pi05.policy.action_edit = self._vls_action_edit(task)
+        for _ in range(MAX_CONSECUTIVE_ENV_ERRORS):
+            unused, start = self._vls_files(task)
+            if len(unused) >= need:
+                return
+            end = start + need - len(unused)
+            out = self.run_dir / "vls_live" / f"{task.label}_init{start}_{time.strftime('%m%d-%H%M%S')}"
+            hydra.core.global_hydra.GlobalHydra.instance().clear()  # this process's Hydra is on residual/
+            with hydra.initialize_config_dir(config_dir=str(VLS_ROOT / "configs"), version_base=None):
+                vls_cfg = hydra.compose(config_name="config", overrides=[
+                    f"backend.libero.suite_name={task.suite}", f"backend.libero.task_ids_filter=[{task.task_id}]",
+                    # Episode i of a one-task run starts from train init i; main.py seeds itself from `seed`
+                    f"main.start_episode={start}", f"main.episode_num={end}", f"seed={start}",
+                    f"backend.libero.init_state_dir={Path(cfg.split.train_init_dir).resolve()}",
+                    f"main.record_dir={Path(cfg.online.vls_dir).resolve()}", f"main.output_dir={out}",
+                    f"policy.pi05.pretrained_path={cfg.policy.pretrained_path}", *cfg.online.vls_overrides])
+            log.info(f"VLS live: {task.label}, train inits {start}-{end - 1}, outputs in {out}")
+            runner = None
+            try:
+                runner = vls.Main(vls_cfg, policy=self.pi05.policy)
+                runner.run()
+            except Exception:  # like an env failure in _collect_episode: retried, not the end of the run
+                log.exception(f"VLS live launch failed ({task.label}, train inits {start}-{end - 1})")
+            finally:
+                if runner is not None:
+                    runner.adapter.close()
+        raise RuntimeError(f"VLS recorded too few episodes of {task.label} in {MAX_CONSECUTIVE_ENV_ERRORS} launches; "
+                           f"see {self.run_dir / 'vls_live'}")
 
     def _record_episode(self, result: dict, *, stage: int, rnd: int, online: bool) -> None:
         task, ep, init_id, ret = self.tasks[result["task"]], result["ep"], result["init_id"], result["return"]
@@ -643,6 +791,8 @@ class Trainer:
             self.run_eval()
             return
         cfg, s = self.cfg, self.state
+        if self.vls_per_task:
+            self._check_vls_supply()
         if cfg.eval.baseline_at_start:  # also on resume: only items without a stored outcome are run
             self._ensure_baseline(cfg.eval.final_episodes_per_task)
         if s["stage"] == 1:
@@ -667,7 +817,10 @@ class Trainer:
         warmup = self.action_mode and rnd <= cfg.actor.warmup_rounds
         s["actor_on"] = self.action_mode and not warmup
         start = time.perf_counter()
-        per_task = [cfg.online.episodes_per_task] * len(self.tasks)
+        vls_per_task = 0 if warmup else self.vls_per_task  # warm-up rounds are all on-policy
+        if vls_per_task:
+            self.collect_vls(rnd)
+        per_task = [cfg.online.episodes_per_task - vls_per_task] * len(self.tasks)
         self.collect(self.remaining(per_task, stage=3, rnd=rnd), stage=3, rnd=rnd, online=True)
         self.train()
         self.gate()
@@ -695,8 +848,13 @@ class Trainer:
         if self.rank > 0:
             return
         this_round = [ep for ep in self.buffer.episodes if ep["stage"] == 3 and ep["round"] == rnd]
-        metrics = {"round/wall_time": wall, "round/mean_length": float(np.mean([ep["steps"] for ep in this_round])),
-                   "round/train_success": float(np.mean([ep["success"] for ep in this_round]))}
+        def mean(values: list) -> float:
+            return float(np.mean(values)) if values else float("nan")
+        metrics = {"round/wall_time": wall, "round/mean_length": mean([ep["steps"] for ep in this_round]),
+                   "round/train_success": mean([ep["success"] for ep in this_round])}
+        vls = [ep["success"] for ep in self.buffer.episodes if ep["stage"] == 0 and ep["round"] == rnd]
+        if vls:  # the round's VLS episodes, apart from the policy's train success
+            metrics.update({"round/vls_success": mean(vls), "round/vls_episodes": len(vls)})
         for suite in {t.suite for t in self.tasks}:
             outcomes = [ep["success"] for ep in this_round if ep["suite"] == suite]
             metrics[f"round/train_success_{suite}"] = float(np.mean(outcomes)) if outcomes else float("nan")
@@ -714,7 +872,7 @@ class Trainer:
         metrics.update({"progress/chunks": self.buffer.size, "progress/frac": rnd / rounds,
                         "progress/eta_hours": eta, "progress/actor_on": float(self.state["actor_on"])})
         log.info(f"Round {rnd}/{rounds} | {self.buffer.size} chunks | actor {actor} | train success "
-                 f"{metrics['round/train_success']:.3f} | round {wall / 60:.1f} min | ETA {eta:.1f} h")
+                 f"{metrics['round/train_success']:.3f}{f' | VLS success {mean(vls):.3f}' if vls else ''} | round {wall / 60:.1f} min | ETA {eta:.1f} h")
         self.monitor.log(metrics, **self.axes())
 
 

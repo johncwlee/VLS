@@ -157,6 +157,20 @@ def test_buffer_resume_and_readonly_view(tmp_path):
     assert grown.size == 9 and grown.data["terminal"][8] and grown.data["terminal"][2]
 
 
+def test_buffer_protected_override(tmp_path):
+    """online.vls_pool: an online episode can go whole into the protected pool, or stay out of it steered chunks
+    included; without the argument only its steered chunks are protected."""
+    buf = ReplayBuffer(tmp_path, 20, field_specs((3, 4, 4), DIMS, images=False))
+    chunks = {"a_exec": np.ones((3, DIMS.exec_horizon, DIMS.action_dim), np.float32),
+              "steered": np.array([True, False, False]), "terminal": np.array([False, False, True]),
+              "success": np.array([False, False, True])}
+    buf.add_episode(chunks, {"task": 0}, online=True, heldout=False)
+    buf.add_episode(chunks, {"task": 0}, online=True, heldout=False, protected=True)
+    buf.add_episode(chunks, {"task": 0}, online=True, heldout=False, protected=False)
+    np.testing.assert_array_equal(buf.protected_idx, [0, 3, 4, 5])
+    np.testing.assert_array_equal(buf.online_idx, np.arange(9))
+
+
 def test_non_finite_update_does_not_step():
     agent = make_agent(edit={"scale": 0.1})
     before = {k: v.clone() for k, v in agent.state_dict().items()}

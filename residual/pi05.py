@@ -43,11 +43,13 @@ class Pi05Base:
 
 
 class Pi05:
-    def __init__(self, pretrained_path: str, device: str):
+    def __init__(self, pretrained_path: str, device: str, policy_cls: type[PI05Policy] = PI05Policy):
+        """policy_cls: a PI05Policy subclass without extra weights (VLS's PI05PolicySteer), so that live VLS
+        episodes run on these weights instead of loading a second copy."""
         config = PreTrainedConfig.from_pretrained(pretrained_path)
         config.compile_model = False  # compile only wraps sample_actions, which the residual sampler replaces
         config.device = device
-        self.policy = PI05Policy.from_pretrained(pretrained_path, config=config)
+        self.policy = policy_cls.from_pretrained(pretrained_path, config=config)
         self.policy.to(device).eval().requires_grad_(False)
         self.model = self.policy.model
         self.preprocessor, self.postprocessor = make_pre_post_processors(

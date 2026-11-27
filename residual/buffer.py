@@ -83,9 +83,11 @@ class ReplayBuffer:
         self.protected_idx = np.flatnonzero(d["protected"][:n] & trainable)
         self.online_idx = np.flatnonzero(d["online"][:n] & trainable)
 
-    def add_episode(self, chunks: dict[str, np.ndarray], meta: dict, online: bool, heldout: bool) -> None:
+    def add_episode(self, chunks: dict[str, np.ndarray], meta: dict, online: bool, heldout: bool,
+                    protected: bool | None = None) -> None:
         """Append one finished episode (dict of [T, ...] arrays; fields outside the layout are not stored) and
-        persist the index atomically."""
+        persist the index atomically. protected: None = offline episodes and steered online chunks; a bool puts
+        every chunk of the episode in (or keeps it out of) the protected pool."""
         length = len(chunks["a_exec"])
         if self.size + length > self.capacity:
             # ponytail: no ring overwrite (protected data must survive); raise capacity if a run outgrows it
@@ -95,7 +97,7 @@ class ReplayBuffer:
             self.data[k][rows] = chunks[k]
         steered = np.asarray(chunks["steered"], dtype=bool)
         self.data["online"][rows] = online
-        self.data["protected"][rows] = steered | (not online)
+        self.data["protected"][rows] = steered | (not online) if protected is None else protected
         self.data["heldout"][rows] = heldout
         for arr in self.data.values():
             arr.flush()

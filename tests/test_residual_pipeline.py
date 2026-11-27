@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -31,12 +32,12 @@ SMALL = ["logging.wandb.mode=offline", "env.suites=[libero_spatial]", "env.task_
          "train.buffer_capacity_per_task=2000", "logging.log_every_updates=10", "logging.video_eval_per_task=0"]
 
 
-def launch(hydra_dir: Path, *overrides: str) -> str:
+def launch(hydra_dir: Path, *overrides: str, ok: bool = True) -> str:
     proc = subprocess.run([sys.executable, "-m", "residual.train", *SMALL, *overrides, f"hydra.run.dir={hydra_dir}"],
                           cwd=VLS, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=TIMEOUT_S,
                           check=False)
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 0, out[-5000:]
+    assert (proc.returncode == 0) == ok, out[-5000:]
     return out
 
 
@@ -84,3 +85,33 @@ def test_warmup_resume_actor_and_repeatable_eval(tmp_path):
         assert {"policy_round0", "policy_train_round0"} <= json.loads((eval_dir / "eval_summary.json").read_text()).keys()
         tables.append({p.name: p.read_text() for p in sorted((eval_dir / "tables").glob("policy*"))})
     assert tables[0] and tables[0] == tables[1]
+
+
+VLS_EPISODES = VLS.parents[1] / "data" / "residual" / "vls_expert"
+
+
+@pytest.mark.skipif(len(list((VLS_EPISODES / "libero_spatial_task" / "task1").glob("init*.npz"))) < 4,
+                    reason="needs recorded VLS episodes of libero_spatial_task t1 (main.py, main.record_dir)")
+def test_recorded_vls_share_of_the_rounds(tmp_path):
+    run_dir = tmp_path / "run"
+    vls = ("online.vls_source=recorded", "online.on_policy_ratio=0.5", "eval.baseline_at_start=false",
+           "actor.warmup_rounds=1")
+
+    launch(run_dir, *vls, "online.rounds=2")
+    launch(tmp_path / "hydra_resume", *vls, "online.rounds=3", f"train.resume_dir={run_dir}")
+    buffer = json.loads((run_dir / "buffer" / "meta.json").read_text())
+    imported = [e for e in buffer["episodes"] if "expert" in e]
+    assert [e["round"] for e in imported] == [2, 2, 3, 3] and len({e["expert"] for e in imported}) == 4
+    assert all(e["online"] and not e["heldout"] and e["stage"] == 0 for e in imported)
+    assert all(e["success"] == e["expert"].endswith("_success.npz") for e in imported)
+    for rnd, policy in ((1, 4), (2, 2), (3, 2)):  # the warm-up round is all on-policy; then 2 of the 4 episodes
+        assert sum(e["stage"] == 3 and e["round"] == rnd for e in buffer["episodes"]) == policy
+    protected = np.memmap(run_dir / "buffer" / "protected.bin", dtype=bool, mode="r")
+    assert all(protected[e["start"]:e["start"] + e["length"]].all() for e in imported)  # vls_pool=both
+    rows = jsonl(run_dir / "metrics.jsonl")
+    assert [r["round/vls_episodes"] for r in rows if "round/vls_episodes" in r] == [2, 2]
+
+    out = launch(tmp_path / "short", *vls, "online.rounds=100", ok=False)  # 50 files < 99 rounds x 2
+    assert "too few VLS episodes" in out
+    out = launch(tmp_path / "vls_pool", *vls, "offline.source=vls", ok=False)
+    assert "online.vls_pool=both" in out

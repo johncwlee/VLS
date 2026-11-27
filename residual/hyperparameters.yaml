@@ -128,6 +128,21 @@ online:                       # spec Stage 3 (no agent yet)
                               # resampled ~130x per round at 1500; untested). qam_velocity: use 200 (~13 min at 32)
   offline_ratio: 0.5          # fraction of each batch from the protected pool (spec §9: 50:50, RLPD-style)
   heldout_frac: 0.0           # share of online episodes kept out of training for the logged gate/* action metrics (0: none)
+  vls_source: none            # none: every episode of a round is on-policy (default)
+                              # recorded: a share of each round is the next unused VLS episodes under vls_dir; the
+                              #           run stops at start if a task has too few for all rounds. Any cluster, but
+                              #           those episodes steered plain π0.5, not this run's residual
+                              # live:     same, and VLS first records the missing ones into vls_dir, in this process
+                              #           on the loaded π0.5, steering π0.5 + the current residual (needs the VLM
+                              #           and a vls_dir of this run's own)
+  on_policy_ratio: 0.7        # vls_source != none: share of episodes_per_task the policy collects (rounded); the
+                              # rest are VLS episodes of the same task, success or failure, never held out.
+                              # Warm-up rounds (actor.warmup_rounds) stay all on-policy
+  vls_pool: both              # both: every chunk of those VLS episodes is in the protected (offline) and the online
+                              #       pool (not with offline.source=vls); online: the online pool only
+  vls_dir: ${offline.expert_dir}   # <dir>/<suite>/task<id>/init<i>_<outcome>.npz, as VLS main.record_dir writes
+  vls_overrides: []           # live: extra VLS main.py overrides (VLM provider / model, ...); on the command line
+                              # quote each: 'online.vls_overrides=["perception.vlm_agent.free_form_reward=true"]'
 
 train:
   batch_size: 256             # PER GPU: a -g N run trains on N x batch_size rows per update (RLPD uses 256).
